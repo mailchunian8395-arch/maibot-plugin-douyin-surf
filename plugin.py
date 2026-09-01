@@ -827,11 +827,14 @@ class DouyinSurfPlugin(MaiBotPlugin):
             authentication_retry_after = float(self._store.get_state(authentication_state_key, "0") or 0)
             if authentication_retry_after > time.time():
                 remaining_seconds = max(1, int(authentication_retry_after - time.time()))
-                logger.info(
-                    "抖音推荐流等待人工完成安全验证，暂不重复打开 retry_after=%ss",
-                    remaining_seconds,
-                )
-                return []
+                if await self._browser.douyin_authentication_pending():
+                    logger.info(
+                        "抖音推荐流等待人工完成安全验证，暂不重复打开 retry_after=%ss",
+                        remaining_seconds,
+                    )
+                    return []
+                self._store.set_state(authentication_state_key, 0)
+                logger.info("检测到抖音登录或验证已完成，立即恢复推荐流冲浪")
             try:
                 return await self._browser.discover_douyin_recommendations(
                     max_results=self.config.browser.douyin_recommendation_candidates_per_cycle,
@@ -895,12 +898,15 @@ class DouyinSurfPlugin(MaiBotPlugin):
             authentication_retry_after = float(self._store.get_state(authentication_state_key, "0") or 0)
             if authentication_retry_after > time.time():
                 remaining_seconds = max(1, int(authentication_retry_after - time.time()))
-                logger.info(
-                    "抖音等待人工完成安全验证，暂不重复打开搜索页 source=%s retry_after=%ss",
-                    source,
-                    remaining_seconds,
-                )
-                return []
+                if await self._browser.douyin_authentication_pending():
+                    logger.info(
+                        "抖音等待人工完成安全验证，暂不重复打开搜索页 source=%s retry_after=%ss",
+                        source,
+                        remaining_seconds,
+                    )
+                    return []
+                self._store.set_state(authentication_state_key, 0)
+                logger.info("检测到抖音登录或验证已完成，立即恢复搜索冲浪 source=%s", source)
             # 已经入库、发过或被筛掉的作品都不应反复占据综合页首屏。把它们传给
             # 页面解析器后，首屏凑不齐新的两个候选时才会执行配置的一次下拉，
             # 从而在同一标签中持续向后寻找新内容。

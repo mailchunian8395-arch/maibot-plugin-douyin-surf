@@ -490,6 +490,35 @@ class DeepBrowser:
             self._playwright = None
         self._headless = None
 
+    async def douyin_authentication_pending(self) -> bool:
+        """检查用户正在操作的可见抖音窗口是否仍显示登录或验证提示。
+
+        此方法绝不调用 ``_ensure``：等待人工登录时若重新启动无头上下文，
+        Playwright 会关闭现有可见窗口，导致手机号验证流程中断。
+        """
+
+        async with self._lock:
+            if self._context is None or self._headless is not False:
+                return True
+            douyin_pages = [
+                page
+                for page in self._context.pages
+                if not bool(page.is_closed())
+                and "douyin.com" in (urlparse(str(page.url or "")).hostname or "").lower()
+            ]
+            if not douyin_pages:
+                return True
+            for page in douyin_pages:
+                try:
+                    body_text = str(
+                        await page.locator("body").inner_text(timeout=self.timeout_ms) or ""
+                    )
+                except Exception:
+                    return True
+                if _douyin_requires_authentication(body_text):
+                    return True
+            return False
+
     async def close_douyin_recommendations(self) -> None:
         """结束连续刷推荐任务时关闭专用浏览器，清理所有残留标签。"""
 
