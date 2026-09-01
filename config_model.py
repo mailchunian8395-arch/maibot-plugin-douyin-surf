@@ -29,7 +29,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="启用抖音冲浪与分享功能")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.0.5", description="配置版本")
 
 
 @ui_labels(values="筛选底线", reply_style="分享文案风格")
@@ -114,6 +114,7 @@ class DirectVisionModelSection(DirectTextModelSection):
     min_comment_count="最低评论数",
     min_collect_count="最低收藏数",
     min_share_count="最低转发数",
+    allow_douyin_notes="允许抖音图文",
     max_video_duration_seconds="候选视频最长秒数",
     recent_only_enabled="启用发布时间限制",
     recent_days="候选最近天数",
@@ -129,6 +130,7 @@ class CandidateFilterSection(PluginConfigBase):
     min_comment_count: int = Field(default=0, ge=0, description="候选至少需要的评论数；0 为不限制")
     min_collect_count: int = Field(default=0, ge=0, description="候选至少需要的收藏数；0 为不限制")
     min_share_count: int = Field(default=0, ge=0, description="候选至少需要的转发数；0 为不限制")
+    allow_douyin_notes: bool = Field(default=False, description="是否将抖音图文笔记纳入候选；关闭后只收录和分享视频")
     max_video_duration_seconds: int = Field(default=180, ge=1, le=3600, description="只候选不超过该时长的抖音视频；单位：秒")
     recent_only_enabled: bool = Field(default=False, description="开启后只候选最近指定天数内发布的视频")
     recent_days: int = Field(default=1, ge=1, description="开启发布时间限制后允许候选的最近天数")
@@ -206,6 +208,18 @@ class SharingSection(SharingSettings):
     stream_configs: list[ChatSharingRule] = Field(default_factory=list, description="点击添加项目后，选择群聊或私聊，再填写对应群号或 QQ 号")
 
 
+@ui_labels(enabled="启用指令白名单", allowed_targets="允许使用指令的目标")
+class CommandAccessSection(PluginConfigBase):
+    """限制会发起浏览或打开浏览器的交互命令。"""
+
+    __ui_label__ = "指令权限"
+    __ui_icon__ = "shield-check"
+    __ui_order__ = 5
+
+    enabled: bool = Field(default=True, description="开启后，只有下方列出的 QQ 群聊或私聊能使用抖音搜索、冲浪和浏览器登录命令")
+    allowed_targets: list[ChatSharingRule] = Field(default_factory=list, description="点击添加项目后，选择群聊或私聊，再填写对应群号或 QQ 号；未添加任何目标时禁止这些指令")
+
+
 @ui_labels(
     enabled="启用抖音浏览器",
     headless="隐藏浏览器窗口",
@@ -247,7 +261,7 @@ class BrowserSettings(PluginConfigBase):
 class BrowserSection(BrowserSettings):
     __ui_label__ = "抖音浏览器"
     __ui_icon__ = "browser"
-    __ui_order__ = 5
+    __ui_order__ = 6
 
 
 
@@ -268,7 +282,7 @@ class RetentionSettings(PluginConfigBase):
 class RetentionSection(RetentionSettings):
     __ui_label__ = "冲浪记录保留"
     __ui_icon__ = "archive"
-    __ui_order__ = 6
+    __ui_order__ = 7
 
 
 
@@ -291,7 +305,7 @@ class VideoSettings(PluginConfigBase):
 class VideoSection(VideoSettings):
     __ui_label__ = "视频处理"
     __ui_icon__ = "video"
-    __ui_order__ = 7
+    __ui_order__ = 8
 
 
 
@@ -303,6 +317,7 @@ class VideoSection(VideoSettings):
     direct_vision_model="视觉模型直连",
     candidate_filter="候选筛选",
     sharing="主动分享",
+    command_access="指令权限",
     browser="抖音浏览器",
     video="视频处理",
     retention="冲浪记录保留",
@@ -315,6 +330,7 @@ class DouyinSurfConfig(PluginConfigBase):
     direct_vision_model: DirectVisionModelSection = Field(default_factory=DirectVisionModelSection)
     candidate_filter: CandidateFilterSection = Field(default_factory=CandidateFilterSection)
     sharing: SharingSection = Field(default_factory=SharingSection)
+    command_access: CommandAccessSection = Field(default_factory=CommandAccessSection)
     browser: BrowserSection = Field(default_factory=BrowserSection)
     video: VideoSection = Field(default_factory=VideoSection)
     retention: RetentionSection = Field(default_factory=RetentionSection)

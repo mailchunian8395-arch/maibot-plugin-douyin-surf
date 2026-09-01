@@ -325,6 +325,7 @@ def _douyin_search_results_from_payload(
     min_comment_count: int = 0,
     min_collect_count: int = 0,
     min_share_count: int = 0,
+    allow_douyin_notes: bool = False,
     max_video_duration_seconds: int = 0,
     excluded_urls: set[str] | None = None,
 ) -> list[dict[str, Any]]:
@@ -342,6 +343,8 @@ def _douyin_search_results_from_payload(
         if _is_douyin_live_aweme(raw_aweme):
             return
         is_note = bool(raw_aweme.get("images") or raw_aweme.get("image_post_info") or raw_aweme.get("imagePostInfo"))
+        if is_note and not allow_douyin_notes:
+            return
         duration = _douyin_duration_seconds(raw_aweme)
         if not is_note and max_video_duration_seconds > 0 and (
             duration is None or duration > max_video_duration_seconds
@@ -936,6 +939,7 @@ class DeepBrowser:
         min_comment_count: int = 0,
         min_collect_count: int = 0,
         min_share_count: int = 0,
+        allow_douyin_notes: bool = False,
         max_video_duration_seconds: int = 0,
         excluded_urls: set[str] | None = None,
         keep_open: bool = False,
@@ -1001,6 +1005,7 @@ class DeepBrowser:
                             min_comment_count=min_comment_count,
                             min_collect_count=min_collect_count,
                             min_share_count=min_share_count,
+                            allow_douyin_notes=allow_douyin_notes,
                             max_video_duration_seconds=max_video_duration_seconds,
                             excluded_urls=excluded,
                         ):
@@ -1107,6 +1112,7 @@ class DeepBrowser:
         min_comment_count: int = 0,
         min_collect_count: int = 0,
         min_share_count: int = 0,
+        allow_douyin_notes: bool = False,
         max_video_duration_seconds: int = 0,
         allow_low_metadata_results: bool = False,
         excluded_urls: set[str] | None = None,
@@ -1188,6 +1194,7 @@ class DeepBrowser:
                             min_comment_count=min_comment_count,
                             min_collect_count=min_collect_count,
                             min_share_count=min_share_count,
+                            allow_douyin_notes=allow_douyin_notes,
                             max_video_duration_seconds=max_video_duration_seconds,
                             excluded_urls=excluded,
                         )
@@ -1310,6 +1317,8 @@ class DeepBrowser:
                     href = str(await link.get_attribute("href") or "").strip()
                     url = douyin_content_url(href)
                     if not url:
+                        continue
+                    if not allow_douyin_notes and "/note/" in url:
                         continue
                     if url in seen_urls:
                         continue

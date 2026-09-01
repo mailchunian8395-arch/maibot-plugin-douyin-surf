@@ -1,6 +1,6 @@
 [plugin]
 enabled = false
-config_version = "1.0.3"
+config_version = "1.0.5"
 
 [identity]
 values = "只分享来源明确、适合当前聊天环境的抖音内容。拒绝涉及明确未成年人、非自愿私密内容、违法内容、恶意引流或无法核实的夸张信息。"
@@ -45,6 +45,7 @@ min_like_count = 5000
 min_comment_count = 0
 min_collect_count = 0
 min_share_count = 0
+allow_douyin_notes = false
 max_video_duration_seconds = 180
 recent_only_enabled = false
 recent_days = 1

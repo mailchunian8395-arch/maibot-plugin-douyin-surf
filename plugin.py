@@ -38,6 +38,7 @@ from .surf_engine import (
 from .video_engine import (
     VideoDurationOutOfRangeError,
     VideoFileTooLargeError,
+    download_images_for_share,
     download_short_video_for_share,
     observe_video,
     probe_video_duration,
@@ -170,6 +171,12 @@ def _share_source_bucket(item: dict[str, Any]) -> str:
 
 def _is_douyin_candidate(item: dict[str, Any]) -> bool:
     return _share_source_bucket(item) == "抖音"
+
+
+def _is_douyin_note(item: dict[str, Any]) -> bool:
+    """判断候选是否为抖音图文笔记。"""
+
+    return "/note/" in _text(item.get("url")).lower()
 
 
 def _manual_douyin_result_matches_query(item: dict[str, Any], query: str) -> bool:
@@ -844,6 +851,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     min_comment_count=self.config.candidate_filter.min_comment_count,
                     min_collect_count=self.config.candidate_filter.min_collect_count,
                     min_share_count=self.config.candidate_filter.min_share_count,
+                    allow_douyin_notes=self.config.candidate_filter.allow_douyin_notes,
                     max_video_duration_seconds=self.config.candidate_filter.max_video_duration_seconds,
                     # 推荐流与过去的搜索结果共用去重池，已经处理过的作品不再占用
                     # 刷推荐的名额，才能持续向后补足本地候选库存。
@@ -942,6 +950,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                                 min_comment_count=self.config.candidate_filter.min_comment_count,
                                 min_collect_count=self.config.candidate_filter.min_collect_count,
                                 min_share_count=self.config.candidate_filter.min_share_count,
+                                allow_douyin_notes=self.config.candidate_filter.allow_douyin_notes,
                                 max_video_duration_seconds=self.config.candidate_filter.max_video_duration_seconds,
                                 excluded_urls=known_douyin_urls,
                             )
@@ -1147,6 +1156,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                             min_comment_count=self.config.candidate_filter.min_comment_count,
                             min_collect_count=self.config.candidate_filter.min_collect_count,
                             min_share_count=self.config.candidate_filter.min_share_count,
+                            allow_douyin_notes=self.config.candidate_filter.allow_douyin_notes,
                             max_video_duration_seconds=self.config.candidate_filter.max_video_duration_seconds,
                             excluded_urls=self._store.known_candidate_urls(),
                             keep_open=inventory_replenishment,
@@ -1587,6 +1597,34 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 return rule
         return None
 
+    async def _command_is_allowed(self, stream_id: str) -> bool:
+        """只让显式授权的群聊或私聊触发会操作抖音的命令。"""
+
+        if not self.config.command_access.enabled:
+            return True
+        if not stream_id:
+            return False
+        for stream in await self._list_known_streams():
+            known_stream_id = _text(stream.get("session_id") or stream.get("stream_id"))
+            if known_stream_id != stream_id:
+                continue
+            stream_keys = self._stream_keys(stream)
+            for rule in self.config.command_access.allowed_targets:
+                target_id = _text(rule.target_id)
+                target_key = f"qq:{rule.target_type}:{target_id}"
+                if rule.enabled and target_id and target_key in stream_keys:
+                    return True
+            return False
+        return False
+
+    async def _ensure_command_allowed(self, stream_id: str):
+        if await self._command_is_allowed(stream_id):
+            return None
+        return await self._send_command_reply(
+            stream_id,
+            "这个聊天还没有被加入抖音指令白名单，无法使用搜索、冲浪或浏览器登录命令。",
+        )
+
     @staticmethod
     def _candidate_matches_tags(candidate: dict[str, Any], tags: list[str]) -> bool:
         """用审核后的主题和页面文本判断候选是否属于一个群的标签池。"""
@@ -1747,6 +1785,10 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 logger.info("本轮没有达到质量线的抖音候选 stream=%s", stream_id)
                 continue
             discovery_id = int(candidate["id"])
+            if _is_douyin_note(candidate) and not self.config.candidate_filter.allow_douyin_notes:
+                self._store.dismiss_discovery(discovery_id, "已关闭抖音图文候选")
+                logger.info("已跳过历史图文候选 item=%s stream=%s", discovery_id, stream_id)
+                continue
             intent = (
                 "这是已通过内容质量、分享时段、冷却和额度检查的抖音主动分享任务，必须调用 reply 完成分享。"
                 "原帖和链接会放在回复前；只补一到三句自然、简短的分享感想，不要编造事实或复述原帖。"
@@ -2208,10 +2250,63 @@ class DouyinSurfPlugin(MaiBotPlugin):
         session_id: str,
         item: dict[str, Any],
     ) -> bool:
-        """图文笔记暂不下载媒体，沿用文字与链接的通用发送路径。"""
+        """下载已打开图文笔记中的原图，并通过一条图文混合消息发送。"""
 
-        del discovery_id, session_id, item
-        return False
+        if (
+            not self.config.candidate_filter.allow_douyin_notes
+            or not session_id
+            or not _is_douyin_note(item)
+            or item.get("media_forwarded_at")
+        ):
+            return False
+        url = _text(item.get("url"))
+        try:
+            try:
+                stored_urls = json.loads(_text(item.get("media_urls_json")) or "[]")
+            except json.JSONDecodeError:
+                stored_urls = []
+            image_urls = [str(image_url) for image_url in stored_urls if isinstance(image_url, str)]
+            if not image_urls:
+                page = await self._browser.read_page(
+                    url,
+                    headless=self.config.browser.headless,
+                    max_chars=self.config.browser.max_text_chars,
+                )
+                image_urls = _page_media_urls(page.get("images"), 9)
+            if not image_urls:
+                logger.info("抖音图文未读取到可下载的正文图片 item=%s", discovery_id)
+                return False
+            browser_cookies = await self._browser.cookies_for(url)
+            images_base64 = await download_images_for_share(
+                image_urls,
+                max_images=9,
+                max_bytes_per_image=self.config.sharing.screenshot_max_bytes,
+                browser_cookies=browser_cookies,
+            )
+            if not images_base64:
+                logger.info("抖音图文正文图片全部下载失败 item=%s", discovery_id)
+                return False
+            title = _text(item.get("observed_title")) or _text(item.get("title"))
+            segments: list[dict[str, Any]] = [
+                {"type": "text", "content": f"{title}\n原链接：{url}".strip()},
+                *({"type": "image", "content": image_base64} for image_base64 in images_base64),
+            ]
+            sent = await self.ctx.send.hybrid(segments, session_id)
+            sent_successfully = bool(sent.get("sent")) if isinstance(sent, dict) else bool(sent)
+            if not sent_successfully:
+                logger.warning("抖音图文混合消息发送失败 item=%s stream=%s", discovery_id, session_id)
+                return False
+        except Exception:
+            logger.exception("抖音图文下载或混合消息发送失败 item=%s stream=%s", discovery_id, session_id)
+            return False
+        self._store.mark_media_forwarded(discovery_id)
+        logger.info(
+            "抖音图文已作为图文混合消息发送 item=%s stream=%s images=%s",
+            discovery_id,
+            session_id,
+            len(images_base64),
+        )
+        return True
 
     async def _forward_share_media(self, discovery_id: int, session_id: str, item: dict[str, Any]) -> bool:
         """通用版不调用第三方媒体接口，保留插件自身的截图降级路径。"""
@@ -2306,6 +2401,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
         del kwargs
         if not self._enabled():
             return await self._send_command_reply(stream_id, "抖音冲浪与分享插件未启用")
+        denied = await self._ensure_command_allowed(stream_id)
+        if denied is not None:
+            return denied
         self._track_task(self._manual_surf_and_notify(stream_id))
         return await self._send_command_reply(stream_id, "开始翻抖音推荐流了，筛完合格内容再回来。")
 
@@ -2339,6 +2437,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
             return await self._send_command_reply(stream_id, "标签太长啦，控制在 60 个字以内再搜。")
         if not self._enabled() or not self.config.browser.enabled:
             return await self._send_command_reply(stream_id, "抖音浏览器尚未启动。")
+        denied = await self._ensure_command_allowed(stream_id)
+        if denied is not None:
+            return denied
         self._track_task(self._manual_douyin_search_and_share(query, stream_id))
         return await self._send_command_reply(stream_id, f"我去翻翻「{query}」，从综合页里挑点赞最高的。")
 
@@ -2364,6 +2465,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     # 让本次关键词的自然响应到齐，避免把“还在加载”误判成“没有结果”。
                     initial_result_wait_ms=4_000,
                     min_like_count=0,
+                    allow_douyin_notes=self.config.candidate_filter.allow_douyin_notes,
                     max_video_duration_seconds=self.config.candidate_filter.max_video_duration_seconds,
                     allow_low_metadata_results=True,
                 )
@@ -2413,6 +2515,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                         minimum_results_before_return=self.config.browser.manual_douyin_min_results_before_scroll,
                         initial_result_wait_ms=4_000,
                         min_like_count=0,
+                        allow_douyin_notes=self.config.candidate_filter.allow_douyin_notes,
                         max_video_duration_seconds=self.config.candidate_filter.max_video_duration_seconds,
                         allow_low_metadata_results=True,
                         excluded_urls=excluded_urls,
@@ -2454,6 +2557,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
             attempted_count = 0
             for candidate in ranked:
                 discovery_id = int(candidate["id"])
+                if _is_douyin_note(candidate) and not self.config.candidate_filter.allow_douyin_notes:
+                    self._store.dismiss_discovery(discovery_id, "手动抖音仅发送视频，已跳过图文笔记")
+                    continue
                 if _json_bool(candidate.get("unsafe")):
                     self._store.dismiss_discovery(discovery_id, "手动抖音候选存在明显安全风险")
                     continue
@@ -2505,6 +2611,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
     @Command("douyin_surf_browser_login", description="打开抖音冲浪专用 Chrome 档案", pattern=r"^/抖音浏览器登录(?:\s+(?P<url>https?://\S+))?$")
     async def command_browser_login(self, stream_id: str = "", matched_groups: dict[str, str] | None = None, **kwargs: Any):
         del kwargs
+        denied = await self._ensure_command_allowed(stream_id)
+        if denied is not None:
+            return denied
         url = _text((matched_groups or {}).get("url"))
         urls = [url] if url else list(self.config.browser.login_pages)
         self._track_task(self._browser.open_login_windows(urls))
