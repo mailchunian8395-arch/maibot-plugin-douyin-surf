@@ -222,27 +222,36 @@ async def _douyin_visible_feed_card_results(
 ) -> list[dict[str, Any]]:
     """从新版综合搜索页已渲染的作品卡片读取元数据。
 
-    新版抖音 PC 综合页的普通视频卡经常不再输出 ``/video/`` 锚点，
-    但会在可见卡片上保留 ``data-e2e=feed-video`` 和 ``data-e2e-vid``。卡片
-    同时可展示左上角“图文”标记、点赞数和右下角时长，必须在这里与作品 ID
-    一一对应，不能只拿到 ID 后放宽筛选条件。
+    新版抖音 PC 综合页会在不同灰度中把作品 ID 放在 ``data-e2e-vid`` 或作品
+    链接里；不能只依赖某一个父节点的 ``data-e2e=feed-video``。卡片同时可展示
+    左上角“图文”标记、点赞数和右下角时长，必须在这里与作品 ID 一一对应，不能
+    只拿到 ID 后放宽筛选条件。
     """
 
-    cards = page.locator('[data-e2e="feed-video"][data-e2e-vid]')
+    cards = page.locator(
+        '[data-e2e-vid], '
+        'a[href*="/video/"], '
+        'a[href*="/note/"], '
+        'a[href*="modal_id="], '
+        'a[href*="aweme_id="]'
+    )
     raw_cards = await cards.evaluate_all(
         """elements => elements.slice(0, 120).map(element => {
-            const videoId = String(element.getAttribute('data-e2e-vid') || '').trim();
+            const href = String(element.getAttribute('href') || '');
+            const hrefIdMatch = href.match(/(?:\\/(?:video|note)\\/|[?&](?:modal_id|aweme_id)=)(\\d{15,22})/);
+            const videoId = String(element.getAttribute('data-e2e-vid') || (hrefIdMatch && hrefIdMatch[1]) || '').trim();
+            const linkSaysNote = /\\/note\\//.test(href);
             const ownText = (element.innerText || '').trim();
             let card = element;
             let cardText = ownText;
-            for (let depth = 0; depth < 3 && card; depth += 1, card = card.parentElement) {
+            for (let depth = 0; depth < 5 && card; depth += 1, card = card.parentElement) {
                 const text = (card.innerText || '').trim();
                 const mediaCount = card.querySelectorAll('img, video, [style*="background-image"]').length;
                 if (text.length >= 4 && text.length <= 2500 && mediaCount >= 1 && text.length > cardText.length) {
                     cardText = text;
                 }
             }
-            return {videoId, ownText, cardText};
+            return {videoId, ownText, cardText, linkSaysNote};
         })"""
     )
     results: list[dict[str, Any]] = []
@@ -262,7 +271,7 @@ async def _douyin_visible_feed_card_results(
         metadata_text = own_text or card_text
         card_lines = [line.strip() for line in card_text.splitlines() if line.strip()]
         metadata_lines = [line.strip() for line in metadata_text.splitlines() if line.strip()]
-        is_note = any(line == "图文" for line in metadata_lines)
+        is_note = bool(raw_card.get("linkSaysNote")) or any(line == "图文" for line in metadata_lines)
         if is_note and not allow_douyin_notes:
             continue
         duration_seconds = _douyin_duration_seconds_from_card_text(own_text, card_text)
@@ -312,6 +321,12 @@ async def _douyin_visible_feed_card_results(
         seen_ids.add(video_id)
         if len(results) >= max(1, int(max_results)):
             break
+    logger.debug(
+        "抖音综合页可见卡片扫描 raw=%s eligible=%s keyword=%s",
+        len(raw_cards) if isinstance(raw_cards, list) else 0,
+        len(results),
+        keyword,
+    )
     return results
 
 
@@ -1487,10 +1502,54 @@ class DeepBrowser:
                             )
                             break
                         scroll_state_before = await page.evaluate(
-                            """() => ({top: window.scrollY, height: document.documentElement.scrollHeight})"""
+                            """() => {
+                                const candidates = [
+                                    document.scrollingElement,
+                                    document.documentElement,
+                                    document.body,
+                                    ...document.querySelectorAll('*'),
+                                ].filter((element, index, all) => {
+                                    if (!element || all.indexOf(element) !== index) return false;
+                                    const style = window.getComputedStyle(element);
+                                    return element.scrollHeight > element.clientHeight + 8
+                                        && (element === document.scrollingElement || /auto|scroll/.test(style.overflowY));
+                                });
+                                const targets = candidates
+                                    .sort((left, right) => (right.scrollHeight - right.clientHeight) - (left.scrollHeight - left.clientHeight))
+                                    .slice(0, 3);
+                                return {
+                                    positions: targets.map(element => ({top: element.scrollTop, height: element.scrollHeight})),
+                                    cardCount: document.querySelectorAll('[data-e2e-vid], a[href*="/video/"], a[href*="/note/"]').length,
+                                };
+                            }"""
                         )
-                        await page.mouse.wheel(0, 1200)
-                        await page.wait_for_timeout(650)
+                        scroll_state_after_wheel = await page.evaluate(
+                            """() => {
+                                const candidates = [
+                                    document.scrollingElement,
+                                    document.documentElement,
+                                    document.body,
+                                    ...document.querySelectorAll('*'),
+                                ].filter((element, index, all) => {
+                                    if (!element || all.indexOf(element) !== index) return false;
+                                    const style = window.getComputedStyle(element);
+                                    return element.scrollHeight > element.clientHeight + 8
+                                        && (element === document.scrollingElement || /auto|scroll/.test(style.overflowY));
+                                });
+                                const targets = candidates
+                                    .sort((left, right) => (right.scrollHeight - right.clientHeight) - (left.scrollHeight - left.clientHeight))
+                                    .slice(0, 3);
+                                let moved = false;
+                                for (const element of targets) {
+                                    const before = element.scrollTop;
+                                    element.scrollTop += 1200;
+                                    moved ||= element.scrollTop > before;
+                                }
+                                window.scrollBy(0, 1200);
+                                return moved;
+                            }"""
+                        )
+                        await page.wait_for_timeout(1_200)
                         body_text = str(await page.locator("body").inner_text(timeout=self.timeout_ms) or "")
                         if _douyin_requires_authentication(body_text):
                             keep_visible_page_for_authentication = not headless
@@ -1499,13 +1558,57 @@ class DeepBrowser:
                                 url=str(page.url or ""),
                             )
                         scroll_state_after = await page.evaluate(
-                            """() => ({top: window.scrollY, height: document.documentElement.scrollHeight})"""
+                            """() => {
+                                const candidates = [
+                                    document.scrollingElement,
+                                    document.documentElement,
+                                    document.body,
+                                    ...document.querySelectorAll('*'),
+                                ].filter((element, index, all) => {
+                                    if (!element || all.indexOf(element) !== index) return false;
+                                    const style = window.getComputedStyle(element);
+                                    return element.scrollHeight > element.clientHeight + 8
+                                        && (element === document.scrollingElement || /auto|scroll/.test(style.overflowY));
+                                });
+                                const targets = candidates
+                                    .sort((left, right) => (right.scrollHeight - right.clientHeight) - (left.scrollHeight - left.clientHeight))
+                                    .slice(0, 3);
+                                return {
+                                    positions: targets.map(element => ({top: element.scrollTop, height: element.scrollHeight})),
+                                    cardCount: document.querySelectorAll('[data-e2e-vid], a[href*="/video/"], a[href*="/note/"]').length,
+                                };
+                            }"""
                         )
-                        before_top = int((scroll_state_before or {}).get("top") or 0)
-                        before_height = int((scroll_state_before or {}).get("height") or 0)
-                        after_top = int((scroll_state_after or {}).get("top") or 0)
-                        after_height = int((scroll_state_after or {}).get("height") or 0)
-                        if after_top <= before_top and after_height <= before_height:
+                        before_positions = (
+                            scroll_state_before.get("positions", [])
+                            if isinstance(scroll_state_before, dict)
+                            else []
+                        )
+                        after_positions = (
+                            scroll_state_after.get("positions", [])
+                            if isinstance(scroll_state_after, dict)
+                            else []
+                        )
+                        position_changed = any(
+                            int((after_positions[index] or {}).get("top") or 0)
+                            > int((before or {}).get("top") or 0)
+                            or int((after_positions[index] or {}).get("height") or 0)
+                            > int((before or {}).get("height") or 0)
+                            for index, before in enumerate(before_positions)
+                            if index < len(after_positions)
+                        )
+                        before_card_count = (
+                            int(scroll_state_before.get("cardCount") or 0)
+                            if isinstance(scroll_state_before, dict)
+                            else 0
+                        )
+                        after_card_count = (
+                            int(scroll_state_after.get("cardCount") or 0)
+                            if isinstance(scroll_state_after, dict)
+                            else 0
+                        )
+                        card_count_changed = after_card_count > before_card_count
+                        if not scroll_state_after_wheel and not position_changed and not card_count_changed:
                             stalled_scrolls += 1
                             if stalled_scrolls >= 2:
                                 logger.info(

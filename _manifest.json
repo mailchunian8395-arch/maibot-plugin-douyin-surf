@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "chunian.maibot-plugin-douyin-surf",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "name": "抖音冲浪与分享",
   "description": "浏览已登录抖音推荐流和综合搜索，按可配置规则筛选并定时分享内容的 MaiBot 插件。",
   "author": {
