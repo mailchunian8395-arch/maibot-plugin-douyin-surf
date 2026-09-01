@@ -2577,6 +2577,29 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 if _is_douyin_note(candidate) and not self.config.candidate_filter.allow_douyin_notes:
                     self._store.dismiss_discovery(discovery_id, "手动抖音仅发送视频，已跳过图文笔记")
                     continue
+                candidate_url = _text(candidate.get("url"))
+                if "douyin.com/video/" in candidate_url:
+                    browser_cookies = await self._browser.cookies_for(candidate_url)
+                    browser_headers = await self._browser.request_headers_for(candidate_url)
+                    duration = await probe_video_duration(
+                        candidate_url,
+                        self.ctx.paths.data_dir / "video-duration-probe-cache",
+                        browser_cookies=browser_cookies,
+                        browser_headers=browser_headers,
+                    )
+                    max_duration = self.config.candidate_filter.max_video_duration_seconds
+                    if duration <= 0 or duration > max_duration:
+                        self._store.dismiss_discovery(
+                            discovery_id,
+                            f"手动抖音视频时长 {duration or '未知'} 秒，不符合候选上限 {max_duration} 秒",
+                        )
+                        logger.info(
+                            "手动抖音最终发送前跳过超长或时长未知视频 item=%s duration=%s max_duration=%s",
+                            discovery_id,
+                            duration,
+                            max_duration,
+                        )
+                        continue
                 if _json_bool(candidate.get("unsafe")):
                     self._store.dismiss_discovery(discovery_id, "手动抖音候选存在明显安全风险")
                     continue
