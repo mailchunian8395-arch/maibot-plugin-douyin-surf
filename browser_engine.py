@@ -21,8 +21,10 @@ _DOUYIN_PROMOTION_PATTERN = re.compile(
 _DOUYIN_AUTH_MARKERS = (
     "扫码登录",
     "登录后即可",
+    "登录后即可搜索更多精彩视频",
     "验证码",
     "安全验证",
+    "请完成下列验证后继续",
     "请选择所有符合上述描述的图片",
     "拖拽到这里",
 )
@@ -37,6 +39,10 @@ _DOUYIN_SSR_AWEME_ID_PATTERN = re.compile(
 
 class DouyinSearchAuthenticationError(RuntimeError):
     """抖音页面明确要求登录或人工安全验证。"""
+
+    def __init__(self, message: str, *, url: str = "") -> None:
+        super().__init__(message)
+        self.url = str(url or "").strip()
 
 
 class DouyinSearchNoResultError(RuntimeError):
@@ -1114,7 +1120,8 @@ class DeepBrowser:
                 if _douyin_requires_authentication(body_text):
                     keep_visible_page_for_authentication = not headless
                     raise DouyinSearchAuthenticationError(
-                        "抖音搜索出现登录或图形安全验证，请在已打开的浏览器窗口完成验证后重试"
+                        "抖音搜索出现登录或图形安全验证，请在已打开的浏览器窗口完成验证后重试",
+                        url=str(page.url or ""),
                     )
 
                 async def parse_search_responses() -> tuple[list[dict[str, Any]], list[str]]:
@@ -1237,6 +1244,16 @@ class DeepBrowser:
                         len(search_responses),
                     )
                     return api_results
+
+                # 抖音有时先展示搜索骨架，滚动或等待期间才弹出登录遮罩、滑块验证。
+                # 最终判空前必须再次检测，才能转为可见窗口并给用户留出完成登录的时间。
+                body_text = str(await page.locator("body").inner_text(timeout=self.timeout_ms) or "")
+                if _douyin_requires_authentication(body_text):
+                    keep_visible_page_for_authentication = not headless
+                    raise DouyinSearchAuthenticationError(
+                        "抖音搜索出现登录或图形安全验证，请在已打开的浏览器窗口完成验证后重试",
+                        url=str(page.url or ""),
+                    )
 
                 results: list[dict[str, Any]] = []
                 seen_urls: set[str] = set()

@@ -50,7 +50,9 @@ _DIRECT_API_OPTION = "自定义 API"
 _ITEM_ARG = "_douyin_surf_item_id"
 _PENDING_MAX_AGE_SECONDS = 10 * 60
 _DOUYIN_EMPTY_PAGE_COOLDOWN_SECONDS = 3 * 60
-_DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS = 3 * 60
+# 手机号登录和图形验证可能需要较长时间；等待期间绝不能重启隐藏浏览器，
+# 否则会关闭用户正在操作的可见窗口。
+_DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS = 15 * 60
 # MaiBot 官方 NapCat 适配器公开的 QQ 群消息 API。
 _NAPCAT_GROUP_MESSAGE_API = "adapter.napcat.group.send_group_msg"
 # MaiBot 官方 SnowLuma 适配器公开的 QQ 群消息 API。
@@ -850,7 +852,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     authentication_state_key,
                     time.time() + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS,
                 )
-                await self._request_douyin_authentication(reason=str(exc))
+                await self._request_douyin_authentication(reason=str(exc), url=exc.url)
                 logger.warning(
                     "抖音推荐流出现人工安全验证，暂停自动冲浪 %s 秒 reason=%s",
                     _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS,
@@ -972,7 +974,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                             authentication_state_key,
                             time.time() + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS,
                         )
-                        await self._request_douyin_authentication(reason=str(exc))
+                        await self._request_douyin_authentication(reason=str(exc), url=exc.url)
                         logger.warning(
                             "抖音搜索出现人工安全验证，暂停自动冲浪 %s 秒 source=%s keyword=%s reason=%s",
                             _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS,
@@ -1150,7 +1152,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                             )
                         )
                     except DouyinSearchAuthenticationError as exc:
-                        await self._request_douyin_authentication(reason=str(exc))
+                        await self._request_douyin_authentication(reason=str(exc), url=exc.url)
                         logger.warning("抖音推荐流等待人工完成安全验证，本轮仅保留搜索结果：%s", exc)
                     except Exception as exc:
                         logger.warning("抖音推荐流浏览失败，本轮仅保留搜索结果：%s", exc)
@@ -1634,7 +1636,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
         # 只允许在“聊天流独立规则”中明确添加过的 QQ 群聊或私聊进入自动分享流程。
         return [stream for stream in streams if self._stream_rule_for_stream(stream) is not None]
 
-    async def _request_douyin_authentication(self, *, reason: str) -> None:
+    async def _request_douyin_authentication(self, *, reason: str, url: str = "") -> None:
         """打开可见验证窗口，并向已配置聊天流发送一次人工处理提醒。"""
 
         state_key = "douyin_authentication_prompt_until"
@@ -1645,7 +1647,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
 
         # 无头上下文无法操作图形验证。切换到同一浏览器档案的可见窗口后，
         # 抖音登录态和用户完成的验证都会保留在该档案中供后续自动冲浪使用。
-        await self._browser.open_login_windows(list(self.config.browser.login_pages))
+        authentication_url = _text(url)
+        login_urls = [authentication_url] if authentication_url else list(self.config.browser.login_pages)
+        await self._browser.open_login_windows(login_urls)
         self._store.set_state(state_key, now + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS)
 
         notice = (
