@@ -32,6 +32,13 @@ _DOUYIN_LIKE_PATTERN = re.compile(
     r"(?P<count>\d+(?:\.\d+)?)\s*(?P<unit>万|w)?\s*(?:个?赞|点赞)",
     re.IGNORECASE,
 )
+_DOUYIN_CARD_LIKE_PATTERN = re.compile(
+    r"(?<![\d.:：])(?P<count>\d+(?:\.\d+)?)\s*(?P<unit>万|w)(?![\w.])",
+    re.IGNORECASE,
+)
+_DOUYIN_DURATION_TEXT_PATTERN = re.compile(
+    r"(?<!\d)(?:(?P<hours>\d{1,2}):)?(?P<minutes>\d{1,2}):(?P<seconds>\d{2})(?!\d)"
+)
 _DOUYIN_SSR_AWEME_ID_PATTERN = re.compile(
     r"(?:\\?[\"'](?:aweme_id|awemeId|item_id|itemId|modal_id|modalId)\\?[\"']\s*[:=]\s*\\?[\"']?)(\d{15,22})"
 )
@@ -200,6 +207,114 @@ def _manual_douyin_link_candidate(
     }
 
 
+async def _douyin_visible_feed_card_results(
+    page: Any,
+    *,
+    keyword: str,
+    max_results: int,
+    min_like_count: int,
+    min_comment_count: int,
+    min_collect_count: int,
+    min_share_count: int,
+    allow_douyin_notes: bool,
+    max_video_duration_seconds: int,
+    excluded_urls: set[str],
+) -> list[dict[str, Any]]:
+    """从新版综合搜索页已渲染的作品卡片读取元数据。
+
+    新版抖音 PC 综合页的普通视频卡经常不再输出 ``/video/`` 锚点，
+    但会在可见卡片上保留 ``data-e2e=feed-video`` 和 ``data-e2e-vid``。卡片
+    同时可展示左上角“图文”标记、点赞数和右下角时长，必须在这里与作品 ID
+    一一对应，不能只拿到 ID 后放宽筛选条件。
+    """
+
+    cards = page.locator('[data-e2e="feed-video"][data-e2e-vid]')
+    raw_cards = await cards.evaluate_all(
+        """elements => elements.slice(0, 120).map(element => {
+            const videoId = String(element.getAttribute('data-e2e-vid') || '').trim();
+            const ownText = (element.innerText || '').trim();
+            let card = element;
+            let cardText = ownText;
+            for (let depth = 0; depth < 3 && card; depth += 1, card = card.parentElement) {
+                const text = (card.innerText || '').trim();
+                const mediaCount = card.querySelectorAll('img, video, [style*="background-image"]').length;
+                if (text.length >= 4 && text.length <= 2500 && mediaCount >= 1 && text.length > cardText.length) {
+                    cardText = text;
+                }
+            }
+            return {videoId, ownText, cardText};
+        })"""
+    )
+    results: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw_card in raw_cards if isinstance(raw_cards, list) else []:
+        if not isinstance(raw_card, dict):
+            continue
+        video_id = str(raw_card.get("videoId") or "").strip()
+        own_text = str(raw_card.get("ownText") or "").strip()
+        card_text = str(raw_card.get("cardText") or "").strip()
+        if not re.fullmatch(r"\d{15,22}", video_id) or video_id in seen_ids:
+            continue
+        if not card_text or _is_douyin_promotion_text(card_text):
+            continue
+        # 内容类型、点赞和时长只能读取当前 data-e2e 卡本身，不能从向上的
+        # 容器文本判断；父节点可能同时包含多张作品卡，会把相邻图文误判进来。
+        metadata_text = own_text or card_text
+        card_lines = [line.strip() for line in card_text.splitlines() if line.strip()]
+        metadata_lines = [line.strip() for line in metadata_text.splitlines() if line.strip()]
+        is_note = any(line == "图文" for line in metadata_lines)
+        if is_note and not allow_douyin_notes:
+            continue
+        duration_seconds = _douyin_duration_seconds_from_card_text(own_text, card_text)
+        if not is_note and (duration_seconds is None or duration_seconds > max_video_duration_seconds):
+            continue
+        content_url = f"https://www.douyin.com/{'note' if is_note else 'video'}/{video_id}"
+        if content_url.rstrip("/") in excluded_urls:
+            continue
+        like_count = _douyin_like_count_from_card_text(own_text, card_text)
+        required_metrics = (
+            (like_count, min_like_count),
+            (None, min_comment_count),
+            (None, min_collect_count),
+            (None, min_share_count),
+        )
+        if any(count is None and threshold > 0 for count, threshold in required_metrics):
+            continue
+        if like_count is not None and like_count < max(0, int(min_like_count)):
+            continue
+        title = next((line for line in card_lines if keyword in line or "#" in line), "")
+        if not title:
+            title = next(
+                (
+                    line
+                    for line in card_lines
+                    if len(line) >= 4
+                    and not re.fullmatch(r"[\d.万wW/:：\s]+", line)
+                    and not line.startswith("·")
+                    and not _is_douyin_promotion_text(line)
+                ),
+                f"抖音 {keyword} 视频",
+            )
+        results.append(
+            {
+                "title": title[:500],
+                "url": content_url,
+                "body": (
+                    f"搜索标签：{keyword}\n来源：抖音综合搜索可见作品卡\n"
+                    f"内容类型：{'图文' if is_note else '视频'}\n"
+                    f"点赞：{like_count if like_count is not None else '未读取'}\n"
+                    f"视频时长：{duration_seconds if duration_seconds is not None else '不适用'} 秒\n"
+                    f"{card_text}"
+                )[:4000],
+                "date": visible_date(card_text),
+            }
+        )
+        seen_ids.add(video_id)
+        if len(results) >= max(1, int(max_results)):
+            break
+    return results
+
+
 def _is_douyin_promoted_aweme(raw_aweme: dict[str, Any]) -> bool:
     """识别搜索响应中明确标注的推广作品。"""
 
@@ -314,6 +429,39 @@ def _douyin_like_count_from_text(card_text: str) -> int | None:
     if match.group("unit").lower() in {"万", "w"}:
         count *= 10_000
     return max(0, int(count))
+
+
+def _douyin_like_count_from_card_text(own_text: str, card_text: str) -> int | None:
+    """读取综合页可见卡片的点赞徽标，兼容只显示“15.0万”的新版样式。"""
+
+    for text in (own_text, card_text):
+        count = _douyin_like_count_from_text(text)
+        if count is not None:
+            return count
+        match = _DOUYIN_CARD_LIKE_PATTERN.search(text)
+        if match is None:
+            continue
+        value = float(match.group("count"))
+        if match.group("unit").lower() in {"万", "w"}:
+            value *= 10_000
+        return max(0, int(value))
+    return None
+
+
+def _douyin_duration_seconds_from_card_text(own_text: str, card_text: str) -> int | None:
+    """读取综合页卡片右下角时长；图文卡片没有时长，返回 ``None``。"""
+
+    for text in (own_text, card_text):
+        match = _DOUYIN_DURATION_TEXT_PATTERN.search(text)
+        if match is None:
+            continue
+        hours = int(match.group("hours") or 0)
+        minutes = int(match.group("minutes"))
+        seconds = int(match.group("seconds"))
+        if minutes >= 60 or seconds >= 60:
+            continue
+        return hours * 3600 + minutes * 60 + seconds
+    return None
 
 
 def _douyin_search_results_from_payload(
@@ -1257,9 +1405,16 @@ class DeepBrowser:
                     'a[href*="aweme_id="]'
                 )
                 links = page.locator(link_selector)
+                visible_video_cards = page.locator('[data-e2e="feed-video"][data-e2e-vid]')
                 try:
-                    await links.first.wait_for(
-                        state="attached",
+                    await page.wait_for_function(
+                        """() => Boolean(
+                            document.querySelector(
+                                'a[href*="/video/"], a[href*="/note/"], '
+                                + 'a[href*="modal_id="], a[href*="aweme_id="], '
+                                + '[data-e2e="feed-video"][data-e2e-vid]'
+                            )
+                        )""",
                         timeout=min(self.timeout_ms, 15_000),
                     )
                 except Exception:
@@ -1301,6 +1456,27 @@ class DeepBrowser:
                         "抖音搜索出现登录或图形安全验证，请在已打开的浏览器窗口完成验证后重试",
                         url=str(page.url or ""),
                     )
+
+                visible_card_results = await _douyin_visible_feed_card_results(
+                    page,
+                    keyword=keyword,
+                    max_results=max_results,
+                    min_like_count=min_like_count,
+                    min_comment_count=min_comment_count,
+                    min_collect_count=min_collect_count,
+                    min_share_count=min_share_count,
+                    allow_douyin_notes=allow_douyin_notes,
+                    max_video_duration_seconds=max_video_duration_seconds,
+                    excluded_urls=excluded,
+                )
+                if visible_card_results:
+                    logger.info(
+                        "抖音搜索通过新版可见作品卡获取候选 keyword=%s results=%s cards=%s",
+                        keyword,
+                        len(visible_card_results),
+                        await visible_video_cards.count(),
+                    )
+                    return visible_card_results
 
                 results: list[dict[str, Any]] = []
                 seen_urls: set[str] = set()

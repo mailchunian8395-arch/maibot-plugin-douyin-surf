@@ -2470,10 +2470,27 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     allow_low_metadata_results=True,
                 )
             except DouyinSearchNoResultError as exc:
-                # 综合页没有解析结果不等同于“没有可分享的视频”：保留到后面的
-                # 视频页保底流程再决定，不能在这里直接向群里报失败。
+                # 综合页没有解析结果不等同于“没有可分享的视频”。这里必须真正
+                # 切到视频页保底，不能只记录日志后再次打开综合页。
                 logger.info("手动抖音综合页没有候选，准备尝试视频页 query=%s reason=%s", query, exc)
-                results = []
+                try:
+                    results = await self._browser.discover_douyin_search(
+                        keyword=query,
+                        search_type="video",
+                        max_results=self.config.browser.manual_douyin_search_results,
+                        scroll_rounds=self.config.browser.manual_douyin_scroll_rounds,
+                        headless=self.config.browser.headless,
+                        require_scroll_before_return=True,
+                        minimum_results_before_return=self.config.browser.manual_douyin_min_results_before_scroll,
+                        initial_result_wait_ms=4_000,
+                        min_like_count=0,
+                        allow_douyin_notes=False,
+                        max_video_duration_seconds=self.config.candidate_filter.max_video_duration_seconds,
+                        allow_low_metadata_results=True,
+                    )
+                except DouyinSearchNoResultError as video_exc:
+                    logger.info("手动抖音视频页也没有候选 query=%s reason=%s", query, video_exc)
+                    results = []
             for item in results:
                 item["source"] = "手动·抖音"
             self._store.add_candidates(results)

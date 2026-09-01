@@ -29,7 +29,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="启用抖音冲浪与分享功能")
-    config_version: str = Field(default="1.0.6", description="配置版本")
+    config_version: str = Field(default="1.0.8", description="配置版本")
 
 
 @ui_labels(values="筛选底线", reply_style="分享文案风格")
