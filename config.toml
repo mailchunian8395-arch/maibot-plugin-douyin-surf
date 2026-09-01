@@ -1,0 +1,96 @@
+[plugin]
+enabled = false
+config_version = "1.0.0"
+
+[identity]
+values = "只分享来源明确、适合当前聊天环境的抖音内容。拒绝涉及明确未成年人、非自愿私密内容、违法内容、恶意引流或无法核实的夸张信息。"
+reply_style = "转发说明简短、自然、具体，说明内容亮点和来源；不使用攻击性、色情化或诱导互动的表达。"
+
+[surf]
+enabled = false
+active_hours = "09:00-23:00"
+startup_delay_seconds = 180
+interval_minutes = 30
+directions_per_cycle = 3
+search_results_per_query = 2
+curator_model = "utils"
+vision_model = "vlm"
+retry_backoff_minutes = 15
+batch_cooldown_minutes = 10
+max_candidates_per_batch = 8
+candidate_inventory_pause_at = 30
+candidate_inventory_resume_below = 10
+replenish_cycle_pause_seconds = 2
+
+[direct_text_model]
+api_base_url = ""
+api_key = ""
+model_name = ""
+temperature = 0.2
+max_tokens = 2800
+timeout_seconds = 300
+extra_json = "{}"
+
+[direct_vision_model]
+api_base_url = ""
+api_key = ""
+model_name = ""
+temperature = 0.2
+max_tokens = 2800
+timeout_seconds = 300
+extra_json = "{}"
+
+[candidate_filter]
+min_like_count = 5000
+min_comment_count = 0
+min_collect_count = 0
+min_share_count = 0
+max_video_duration_seconds = 180
+recent_only_enabled = false
+recent_days = 1
+
+[sharing]
+enabled = false
+declined_share_cooldown_minutes = 60
+declined_share_max_attempts = 2
+minimum_share_score = 0.6
+candidate_selection_mode = "最高分优先"
+forward_body_max_chars = 360
+screenshot_enabled = true
+screenshot_probability = 0.9
+screenshot_max_bytes = 5000000
+douyin_video_forward_enabled = true
+douyin_video_max_bytes = 25000000
+reaction_window_minutes = 120
+video_sender_adapter = "自动识别"
+
+[browser]
+enabled = true
+headless = true
+page_timeout_seconds = 45
+max_text_chars = 30000
+native_site_browsing_enabled = true
+douyin_search_retry_count = 1
+douyin_recommendation_cards_per_cycle = 20
+douyin_recommendation_candidates_per_cycle = 20
+douyin_keywords_per_cycle = 3
+auto_douyin_min_results_before_scroll = 2
+auto_douyin_scroll_rounds = 4
+manual_douyin_search_results = 12
+manual_douyin_min_results_before_scroll = 8
+manual_douyin_scroll_rounds = 4
+allowed_domains = ["douyin.com"]
+login_pages = ["https://www.douyin.com/?recommend=1"]
+
+[video]
+enabled = true
+frame_samples = 8
+douyin_frame_samples = 4
+douyin_browser_first = true
+max_subtitle_chars = 50000
+
+[retention]
+enabled = true
+ordinary_candidate_days = 1
+dismissed_days = 7
+shared_days = 90

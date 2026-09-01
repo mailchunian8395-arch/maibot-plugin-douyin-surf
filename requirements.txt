@@ -1,0 +1,5 @@
+# Python 运行依赖；版本需与 _manifest.json 的 dependencies 保持同步。
+openai>=1.95.0
+playwright>=1.40.0
+trafilatura>=2.1.0
+yt-dlp>=2026.8.19

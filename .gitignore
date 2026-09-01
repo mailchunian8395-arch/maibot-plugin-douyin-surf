@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+data/
+browser-profile/
+video-share-cache/
+*.sqlite3
