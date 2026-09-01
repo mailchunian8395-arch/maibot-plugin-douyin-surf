@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import random
 import re
@@ -545,6 +546,7 @@ def _douyin_search_results_from_payload(
 
     extracted: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    decoded_json_strings: set[str] = set()
     excluded = {str(url).rstrip("/") for url in (excluded_urls or set()) if str(url).strip()}
 
     def add_aweme(raw_aweme: Any) -> None:
@@ -631,6 +633,23 @@ def _douyin_search_results_from_payload(
     def visit(value: Any) -> None:
         if len(extracted) >= max(1, int(max_results)):
             return
+        # 某些搜索响应会把真实 JSON 再序列化进 data/result 字符串。它仍然是
+        # 页面自然收到的数据，只是 response.json() 后需要再解一层；否则卡片
+        # 明明渲染在页面上，解析器却只能看见一段普通字符串。
+        if isinstance(value, str):
+            text = value.strip()
+            if (
+                text not in decoded_json_strings
+                and len(text) >= 2
+                and text[0] in "[{"
+                and text[-1] in "]}"
+            ):
+                decoded_json_strings.add(text)
+                try:
+                    visit(json.loads(text))
+                except json.JSONDecodeError:
+                    pass
+            return
         if isinstance(value, list):
             for item in value:
                 visit(item)
@@ -648,6 +667,34 @@ def _douyin_search_results_from_payload(
 
     visit(payload)
     return extracted
+
+
+def _douyin_response_payload_shape(payload: Any, *, depth: int = 0) -> Any:
+    """返回搜索响应的脱敏结构摘要，供页面接口改版时定位字段。"""
+
+    if depth >= 2:
+        return type(payload).__name__
+    if isinstance(payload, dict):
+        return {
+            "type": "dict",
+            "keys": sorted(str(key) for key in payload.keys())[:24],
+            "children": {
+                str(key): _douyin_response_payload_shape(value, depth=depth + 1)
+                for key, value in list(payload.items())[:8]
+                if isinstance(value, (dict, list))
+            },
+        }
+    if isinstance(payload, list):
+        return {
+            "type": "list",
+            "length": len(payload),
+            "first": _douyin_response_payload_shape(payload[0], depth=depth + 1)
+            if payload
+            else None,
+        }
+    if isinstance(payload, str):
+        return {"type": "str", "length": len(payload), "json_like": payload.lstrip().startswith(("{", "["))}
+    return type(payload).__name__
 
 
 class DeepBrowser:
@@ -1364,6 +1411,7 @@ class DeepBrowser:
                 # 所有搜索响应，而非押注某一个灰度接口。不自行构造签名请求，也不
                 # 绕过抖音的访问控制。
                 search_responses: list[Any] = []
+                diagnosed_response_urls: set[str] = set()
 
                 def remember_search_response(response: Any) -> None:
                     response_url = str(getattr(response, "url", ""))
@@ -1410,7 +1458,12 @@ class DeepBrowser:
                         try:
                             response_payload = await search_response.json()
                         except Exception:
-                            continue
+                            # 部分灰度接口的 Content-Type 不是 JSON，但响应正文仍是
+                            # JSON 字符串；只读取当前页面自然收到的响应，不额外请求。
+                            try:
+                                response_payload = json.loads(await search_response.text())
+                            except (Exception, json.JSONDecodeError):
+                                continue
                         response_results = _douyin_search_results_from_payload(
                             response_payload,
                             keyword=keyword,
@@ -1531,6 +1584,14 @@ class DeepBrowser:
                             max_video_duration_seconds=max_video_duration_seconds,
                             excluded_urls=excluded,
                         )
+                        if not response_results and response_url not in diagnosed_response_urls:
+                            logger.info(
+                                "抖音搜索响应结构诊断 keyword=%s url=%s shape=%s",
+                                keyword,
+                                response_url,
+                                _douyin_response_payload_shape(response_payload),
+                            )
+                            diagnosed_response_urls.add(response_url)
                         for item in [*api_results, *visible_card_results]:
                             url = str(item.get("url") or "").rstrip("/")
                             if url:
