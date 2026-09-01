@@ -464,8 +464,14 @@ def _douyin_statistic_count(raw_aweme: dict[str, Any], *keys: str) -> int | None
 def _douyin_duration_seconds(raw_aweme: dict[str, Any]) -> int | None:
     """读取抖音作品时长；网页响应通常以毫秒返回，兼容秒数的字段。"""
 
+    video = raw_aweme.get("video") or raw_aweme.get("videoInfo") or raw_aweme.get("video_info")
+    video = video if isinstance(video, dict) else {}
     for key in ("duration", "duration_ms", "durationMs", "duration_seconds", "durationSeconds"):
+        # 综合搜索接口把作品元数据放在 aweme_info 中，但时长属于它的 video
+        # 子对象；只读顶层会把页面上已展示时长的正常视频误判为“时长未知”。
         raw_value = raw_aweme.get(key)
+        if raw_value is None:
+            raw_value = video.get(key)
         if isinstance(raw_value, bool):
             continue
         if isinstance(raw_value, (int, float)):
