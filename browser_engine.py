@@ -230,6 +230,12 @@ async def _douyin_visible_feed_card_results(
 
     cards = page.locator(
         '[data-e2e-vid], '
+        '[data-aweme-id], '
+        '[data-aweme_id], '
+        '[data-modal-id], '
+        '[data-modal_id], '
+        '[data-e2e*="feed"], '
+        '[data-e2e*="video"], '
         'a[href*="/video/"], '
         'a[href*="/note/"], '
         'a[href*="modal_id="], '
@@ -238,8 +244,19 @@ async def _douyin_visible_feed_card_results(
     raw_cards = await cards.evaluate_all(
         """elements => elements.slice(0, 120).map(element => {
             const href = String(element.getAttribute('href') || '');
+            const ownHtml = String(element.outerHTML || '');
             const hrefIdMatch = href.match(/(?:\\/(?:video|note)\\/|[?&](?:modal_id|aweme_id)=)(\\d{15,22})/);
-            const videoId = String(element.getAttribute('data-e2e-vid') || (hrefIdMatch && hrefIdMatch[1]) || '').trim();
+            const htmlIdMatch = ownHtml.match(/(?:aweme[_-]?id|modal[_-]?id|data-e2e-vid)[^\\d]{0,48}(\\d{15,22})/i);
+            const videoId = String(
+                element.getAttribute('data-e2e-vid')
+                || element.getAttribute('data-aweme-id')
+                || element.getAttribute('data-aweme_id')
+                || element.getAttribute('data-modal-id')
+                || element.getAttribute('data-modal_id')
+                || (hrefIdMatch && hrefIdMatch[1])
+                || (htmlIdMatch && htmlIdMatch[1])
+                || ''
+            ).trim();
             const linkSaysNote = /\\/note\\//.test(href);
             const ownText = (element.innerText || '').trim();
             let card = element;
@@ -328,6 +345,38 @@ async def _douyin_visible_feed_card_results(
         keyword,
     )
     return results
+
+
+async def _douyin_search_card_dom_diagnostics(page: Any) -> dict[str, Any]:
+    """记录一次搜索页卡片结构摘要，供新版页面变更时定位选择器。"""
+
+    raw = await page.evaluate(
+        """() => {
+            const nodes = Array.from(document.querySelectorAll('*'));
+            const interesting = nodes
+                .filter(element => Array.from(element.attributes || []).some(attribute =>
+                    /(?:e2e|aweme|modal|video)/i.test(attribute.name)
+                ))
+                .slice(0, 24)
+                .map(element => ({
+                    tag: element.tagName,
+                    attrs: Array.from(element.attributes || [])
+                        .filter(attribute => /(?:e2e|aweme|modal|video)/i.test(attribute.name))
+                        .map(attribute => `${attribute.name}=${attribute.value}`)
+                        .join(';'),
+                }));
+            const html = String(document.documentElement.innerHTML || '');
+            return {
+                feedVideo: document.querySelectorAll('[data-e2e="feed-video"][data-e2e-vid]').length,
+                anyE2EVid: document.querySelectorAll('[data-e2e-vid]').length,
+                awemeAttributes: document.querySelectorAll('[data-aweme-id], [data-aweme_id], [data-modal-id], [data-modal_id]').length,
+                videoLinks: document.querySelectorAll('a[href*="/video/"], a[href*="/note/"]').length,
+                idLikeValues: (html.match(/\\d{15,22}/g) || []).length,
+                interesting,
+            };
+        }"""
+    )
+    return raw if isinstance(raw, dict) else {}
 
 
 def _is_douyin_promoted_aweme(raw_aweme: dict[str, Any]) -> bool:
@@ -1467,6 +1516,7 @@ class DeepBrowser:
                     # 因而不会出现每个步骤都重新计算一整段等待时间。
                     collected_results: dict[str, dict[str, Any]] = {}
                     stalled_scrolls = 0
+                    card_dom_diagnostics_logged = False
                     while True:
                         api_results, response_urls = await parse_search_responses()
                         visible_card_results = await _douyin_visible_feed_card_results(
@@ -1485,6 +1535,13 @@ class DeepBrowser:
                             url = str(item.get("url") or "").rstrip("/")
                             if url:
                                 collected_results.setdefault(url, item)
+                        if not visible_card_results and not card_dom_diagnostics_logged:
+                            logger.info(
+                                "抖音综合页卡片 DOM 诊断 keyword=%s diagnostic=%s",
+                                keyword,
+                                await _douyin_search_card_dom_diagnostics(page),
+                            )
+                            card_dom_diagnostics_logged = True
                         if len(collected_results) >= target_results:
                             logger.info(
                                 "抖音搜索已收满目标有效候选 keyword=%s results=%s target=%s",
