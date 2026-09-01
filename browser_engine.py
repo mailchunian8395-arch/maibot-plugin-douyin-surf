@@ -19,6 +19,11 @@ _DOUYIN_PROMOTION_PATTERN = re.compile(
     r"(?:广告投放|广告推广|商业推广|dou\+|品牌推广|赞助内容)",
     re.IGNORECASE,
 )
+_DOUYIN_PAID_CONTENT_PATTERN = re.compile(
+    r"(?:付费(?:观看|解锁|内容|视频)?|会员(?:专享|观看|解锁)?|vip(?:专享|观看|解锁)?|"
+    r"解锁后(?:观看|可看)|购买后(?:观看|可看)|付费合集|收费内容)",
+    re.IGNORECASE,
+)
 _DOUYIN_AUTH_MARKERS = (
     "扫码登录",
     "登录后即可",
@@ -188,7 +193,7 @@ def _manual_douyin_link_candidate(
         return None
     text = str(link_text or "").strip()
     title = str(link_title or "").strip()
-    if _is_douyin_promotion_text(f"{title}\n{text}"):
+    if _is_douyin_promotion_text(f"{title}\n{text}") or _is_douyin_paid_text(f"{title}\n{text}"):
         return None
     visible_text = f"{title}\n{text}"
     decoded_href = unquote(str(href or ""))
@@ -282,7 +287,7 @@ async def _douyin_visible_feed_card_results(
         card_text = str(raw_card.get("cardText") or "").strip()
         if not re.fullmatch(r"\d{15,22}", video_id) or video_id in seen_ids:
             continue
-        if not card_text or _is_douyin_promotion_text(card_text):
+        if not card_text or _is_douyin_promotion_text(card_text) or _is_douyin_paid_text(card_text):
             continue
         # 内容类型、点赞和时长只能读取当前 data-e2e 卡本身，不能从向上的
         # 容器文本判断；父节点可能同时包含多张作品卡，会把相邻图文误判进来。
@@ -399,6 +404,48 @@ def _is_douyin_promoted_aweme(raw_aweme: dict[str, Any]) -> bool:
     )
 
 
+def _is_douyin_paid_aweme(raw_aweme: dict[str, Any]) -> bool:
+    """识别抖音响应中明确标注为付费、会员或解锁后可看的作品。"""
+
+    paid_flags = (
+        "is_paid",
+        "isPaid",
+        "is_payment",
+        "isPayment",
+        "is_purchase",
+        "isPurchase",
+        "is_vip",
+        "isVip",
+        "is_charge",
+        "isCharge",
+        "need_pay",
+        "needPay",
+    )
+    if any(raw_aweme.get(key) is True for key in paid_flags):
+        return True
+    paid_metadata = (
+        "payment_info",
+        "paymentInfo",
+        "paid_content_info",
+        "paidContentInfo",
+        "vip_info",
+        "vipInfo",
+        "series_paid_info",
+        "seriesPaidInfo",
+        "charge_info",
+        "chargeInfo",
+    )
+    if any(bool(raw_aweme.get(key)) for key in paid_metadata):
+        return True
+    visible_fields = (
+        raw_aweme.get("desc"),
+        raw_aweme.get("descText"),
+        raw_aweme.get("title"),
+        raw_aweme.get("caption"),
+    )
+    return _is_douyin_paid_text("\n".join(str(value or "") for value in visible_fields))
+
+
 def _is_douyin_live_aweme(raw_aweme: dict[str, Any]) -> bool:
     """排除直播间及其预告卡，推荐流补货只收录可独立分享的作品。"""
 
@@ -419,6 +466,12 @@ def _is_douyin_live_aweme(raw_aweme: dict[str, Any]) -> bool:
 
 def _is_douyin_promotion_text(value: str) -> bool:
     return bool(_DOUYIN_PROMOTION_PATTERN.search(str(value or "")))
+
+
+def _is_douyin_paid_text(value: str) -> bool:
+    """识别综合页卡片上显式展示的付费或会员解锁提示。"""
+
+    return bool(_DOUYIN_PAID_CONTENT_PATTERN.search(str(value or "")))
 
 
 def _douyin_like_count(raw_aweme: dict[str, Any]) -> int | None:
@@ -559,6 +612,8 @@ def _douyin_search_results_from_payload(
         if not isinstance(raw_aweme, dict) or len(extracted) >= max(1, int(max_results)):
             return
         if _is_douyin_promoted_aweme(raw_aweme):
+            return
+        if _is_douyin_paid_aweme(raw_aweme):
             return
         if _is_douyin_live_aweme(raw_aweme):
             return
@@ -1853,7 +1908,7 @@ class DeepBrowser:
                             ),
                             "",
                         )
-                    if not title or _is_douyin_promotion_text(title):
+                    if not title or _is_douyin_promotion_text(title) or _is_douyin_paid_text(card_text):
                         continue
                     if allow_low_metadata_results:
                         # 手动点播不能把搜索页推荐区的 /video/ 链接当作结果。只有
