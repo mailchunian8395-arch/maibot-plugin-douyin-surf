@@ -2495,7 +2495,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 # 发过媒体的作品，避免同一个视频反复占用群聊版面。
                 if not item.get("shared_at") and not item.get("video_shared_at")
             ]
-            if not candidate_ids:
+            if not candidate_ids and results:
                 # 首批都已分享时，必须把它们交给浏览器层排除。否则每次重新打开
                 # 搜索页都会再次从同一批响应里取前 N 条，所谓“补充下拉”实际没有
                 # 机会抵达后面的新作品。
