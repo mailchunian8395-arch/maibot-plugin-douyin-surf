@@ -36,6 +36,17 @@
 | 🧠 内容筛选 | 使用 MaiBot 已配置任务或插件内 OpenAI 兼容 API 评估相关度、质量和适合分享程度。 | 主筛选模型、视觉理解模型、最低分享分。 |
 | 🧹 自动清理 | 清理旧候选和旧分享记录，避免数据库不断累积。 | 候选、已筛除、已分享记录的保留天数。 |
 
+## 🎬 实际效果
+
+下面两张图来自本插件的真实测试环境，展示 QQ 内收到的短视频与附言效果；具体视频内容会随抖音搜索结果和候选筛选而变化。
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="assets/auto-share-video-demo.png" alt="自动分享的短视频和附言效果" width="300"><br><sub>自动分享：候选达标后发送原生短视频，并补充简短附言。</sub></td>
+    <td align="center" width="50%"><img src="assets/manual-search-video-demo.png" alt="手动抖音搜索的短视频发送效果" width="300"><br><sub>手动搜索：输入 <code>/抖音 关键词</code> 后，筛选综合页结果并发送。</sub></td>
+  </tr>
+</table>
+
 ## 🗺️ 工作流程
 
 ```mermaid
