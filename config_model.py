@@ -29,7 +29,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="启用抖音冲浪与分享功能")
-    config_version: str = Field(default="1.0.5", description="配置版本")
+    config_version: str = Field(default="1.0.6", description="配置版本")
 
 
 @ui_labels(values="筛选底线", reply_style="分享文案风格")
@@ -208,6 +208,14 @@ class SharingSection(SharingSettings):
     stream_configs: list[ChatSharingRule] = Field(default_factory=list, description="点击添加项目后，选择群聊或私聊，再填写对应群号或 QQ 号")
 
 
+@ui_labels(target_type="目标类型", target_id="群号或 QQ 号")
+class CommandAccessRule(PluginConfigBase):
+    """一条可使用抖音交互命令的 QQ 群聊或私聊授权。"""
+
+    target_type: Literal["group", "private"] = Field(default="group", description="group 为群聊，private 为私聊")
+    target_id: str = Field(default="", min_length=1, description="群聊时填写群号；私聊时填写 QQ 号")
+
+
 @ui_labels(enabled="启用指令白名单", allowed_targets="允许使用指令的目标")
 class CommandAccessSection(PluginConfigBase):
     """限制会发起浏览或打开浏览器的交互命令。"""
@@ -217,7 +225,7 @@ class CommandAccessSection(PluginConfigBase):
     __ui_order__ = 5
 
     enabled: bool = Field(default=True, description="开启后，只有下方列出的 QQ 群聊或私聊能使用抖音搜索、冲浪和浏览器登录命令")
-    allowed_targets: list[ChatSharingRule] = Field(default_factory=list, description="点击添加项目后，选择群聊或私聊，再填写对应群号或 QQ 号；未添加任何目标时禁止这些指令")
+    allowed_targets: list[CommandAccessRule] = Field(default_factory=list, description="点击添加项目后，选择群聊或私聊，再填写对应群号或 QQ 号；未添加任何目标时禁止这些指令")
 
 
 @ui_labels(

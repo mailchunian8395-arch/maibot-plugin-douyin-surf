@@ -1612,7 +1612,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
             for rule in self.config.command_access.allowed_targets:
                 target_id = _text(rule.target_id)
                 target_key = f"qq:{rule.target_type}:{target_id}"
-                if rule.enabled and target_id and target_key in stream_keys:
+                if target_id and target_key in stream_keys:
                     return True
             return False
         return False
