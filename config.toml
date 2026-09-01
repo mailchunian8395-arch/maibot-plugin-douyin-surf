@@ -1,6 +1,6 @@
 [plugin]
 enabled = false
-config_version = "1.0.9"
+config_version = "1.1.0"
 
 [identity]
 values = "只分享来源明确、适合当前聊天环境的抖音内容。拒绝涉及明确未成年人、非自愿私密内容、违法内容、恶意引流或无法核实的夸张信息。"
@@ -78,8 +78,8 @@ douyin_keywords_per_cycle = 3
 auto_douyin_min_results_before_scroll = 2
 auto_douyin_scroll_rounds = 4
 manual_douyin_search_results = 12
-manual_douyin_min_results_before_scroll = 8
-manual_douyin_scroll_rounds = 4
+manual_douyin_target_results = 10
+manual_douyin_search_timeout_seconds = 300
 allowed_domains = ["douyin.com"]
 login_pages = ["https://www.douyin.com/?recommend=1"]
 

@@ -1256,6 +1256,9 @@ class DeepBrowser:
         require_scroll_before_return: bool = False,
         minimum_results_before_return: int = 1,
         initial_result_wait_ms: int = 0,
+        target_result_count: int = 0,
+        search_timeout_seconds: int = 0,
+        search_deadline_monotonic: float | None = None,
         min_like_count: int = 0,
         min_comment_count: int = 0,
         min_collect_count: int = 0,
@@ -1269,8 +1272,11 @@ class DeepBrowser:
         if search_type not in {"general", "video"}:
             raise ValueError(f"不支持的抖音搜索页类型：{search_type}")
         excluded = {str(url).rstrip("/") for url in (excluded_urls or set()) if str(url).strip()}
+        target_results = max(0, int(target_result_count))
+        if target_results:
+            max_results = max(int(max_results), target_results)
         # 综合页采用网页端当前实际展示作品栅格的精选搜索入口。旧 /search/ 路由
-        # 偶尔只会留下永久骨架屏；视频页仍保留原入口，供手动命令无候选时保底。
+        # 偶尔只会留下永久骨架屏；/抖音 只调用综合页，视频页参数保留给内部兼容调用。
         # 两者均在插件专用、已登录浏览器上下文中自然打开，不构造或伪造接口签名请求。
         search_path = "jingxuan/search" if search_type == "general" else "search"
         search_url = f"https://www.douyin.com/{search_path}/{quote(keyword, safe='')}?type={search_type}"
@@ -1283,6 +1289,13 @@ class DeepBrowser:
             # 其它所有搜索页必须在 finally 中关闭，避免持久化浏览器累积标签。
             keep_visible_page_for_authentication = False
             try:
+                search_deadline = None
+                if target_results:
+                    search_deadline = search_deadline_monotonic
+                    if search_deadline is None and search_timeout_seconds > 0:
+                        search_deadline = (
+                            asyncio.get_running_loop().time() + max(1, int(search_timeout_seconds))
+                        )
                 # 搜索结果页的锚点和卡片频繁改版；收集该页面已登录会话自然发出的
                 # 所有搜索响应，而非押注某一个灰度接口。不自行构造签名请求，也不
                 # 绕过抖音的访问控制。
@@ -1361,6 +1374,7 @@ class DeepBrowser:
                 if (
                     len(api_results) >= minimum_results
                     and not require_scroll_before_return
+                    and not target_results
                 ):
                     logger.info(
                         "抖音搜索通过页面响应获取作品 keyword=%s results=%s response_count=%s",
@@ -1381,6 +1395,7 @@ class DeepBrowser:
                     if (
                         len(api_results) >= minimum_results
                         and not require_scroll_before_return
+                        and not target_results
                     ):
                         logger.info(
                             "抖音搜索等待动态响应后获取作品 keyword=%s results=%s response_count=%s",
@@ -1431,9 +1446,83 @@ class DeepBrowser:
                         keyword,
                         len(response_urls),
                     )
-                await self._settle_dynamic_page(
-                    page, scroll_rounds=scroll_rounds, step=1200, pause_ms=650
-                )
+                if target_results:
+                    # 手动点播以“收满合格视频数”为停止条件，而不是固定下拉次数。
+                    # 首次综合页搜索和排除已发候选后的补充搜索由调用方传入同一截止时间，
+                    # 因而不会出现每个步骤都重新计算一整段等待时间。
+                    collected_results: dict[str, dict[str, Any]] = {}
+                    stalled_scrolls = 0
+                    while True:
+                        api_results, response_urls = await parse_search_responses()
+                        visible_card_results = await _douyin_visible_feed_card_results(
+                            page,
+                            keyword=keyword,
+                            max_results=max_results,
+                            min_like_count=min_like_count,
+                            min_comment_count=min_comment_count,
+                            min_collect_count=min_collect_count,
+                            min_share_count=min_share_count,
+                            allow_douyin_notes=allow_douyin_notes,
+                            max_video_duration_seconds=max_video_duration_seconds,
+                            excluded_urls=excluded,
+                        )
+                        for item in [*api_results, *visible_card_results]:
+                            url = str(item.get("url") or "").rstrip("/")
+                            if url:
+                                collected_results.setdefault(url, item)
+                        if len(collected_results) >= target_results:
+                            logger.info(
+                                "抖音搜索已收满目标有效候选 keyword=%s results=%s target=%s",
+                                keyword,
+                                len(collected_results),
+                                target_results,
+                            )
+                            return list(collected_results.values())[:max_results]
+                        if search_deadline is not None and asyncio.get_running_loop().time() >= search_deadline:
+                            logger.info(
+                                "抖音搜索达到手动时长上限 keyword=%s results=%s target=%s",
+                                keyword,
+                                len(collected_results),
+                                target_results,
+                            )
+                            break
+                        scroll_state_before = await page.evaluate(
+                            """() => ({top: window.scrollY, height: document.documentElement.scrollHeight})"""
+                        )
+                        await page.mouse.wheel(0, 1200)
+                        await page.wait_for_timeout(650)
+                        body_text = str(await page.locator("body").inner_text(timeout=self.timeout_ms) or "")
+                        if _douyin_requires_authentication(body_text):
+                            keep_visible_page_for_authentication = not headless
+                            raise DouyinSearchAuthenticationError(
+                                "抖音搜索出现登录或图形安全验证，请在已打开的浏览器窗口完成验证后重试",
+                                url=str(page.url or ""),
+                            )
+                        scroll_state_after = await page.evaluate(
+                            """() => ({top: window.scrollY, height: document.documentElement.scrollHeight})"""
+                        )
+                        before_top = int((scroll_state_before or {}).get("top") or 0)
+                        before_height = int((scroll_state_before or {}).get("height") or 0)
+                        after_top = int((scroll_state_after or {}).get("top") or 0)
+                        after_height = int((scroll_state_after or {}).get("height") or 0)
+                        if after_top <= before_top and after_height <= before_height:
+                            stalled_scrolls += 1
+                            if stalled_scrolls >= 2:
+                                logger.info(
+                                    "抖音搜索页已无更多可下拉内容 keyword=%s results=%s target=%s",
+                                    keyword,
+                                    len(collected_results),
+                                    target_results,
+                                )
+                                break
+                        else:
+                            stalled_scrolls = 0
+                    if collected_results:
+                        return list(collected_results.values())[:max_results]
+                else:
+                    await self._settle_dynamic_page(
+                        page, scroll_rounds=scroll_rounds, step=1200, pause_ms=650
+                    )
 
                 # 结果页稳定后再读取完整的响应集。这里放在滚动之后，能拿到首屏
                 # 之后才返回的搜索接口，同时也不会把请求中的半截响应当成空结果。

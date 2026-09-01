@@ -2447,50 +2447,40 @@ class DouyinSurfPlugin(MaiBotPlugin):
         """从综合页候选中按公开点赞排序，直接分享可发送的最高项。"""
 
         try:
+            search_deadline = (
+                asyncio.get_running_loop().time()
+                + self.config.browser.manual_douyin_search_timeout_seconds
+            )
+            target_results = self.config.browser.manual_douyin_target_results
+            result_limit = max(self.config.browser.manual_douyin_search_results, target_results)
             try:
                 results = await self._browser.discover_douyin_search(
                     keyword=query,
                     # 手动 /抖音 只浏览综合页；首批均已分享时，下面会排除它们
                     # 并继续向下翻阅同一搜索结果，而不是混入视频页结果。
                     search_type="general",
-                    max_results=self.config.browser.manual_douyin_search_results,
-                    scroll_rounds=self.config.browser.manual_douyin_scroll_rounds,
+                    max_results=result_limit,
+                    scroll_rounds=0,
                     # 手动点播与自动抖音冲浪共用同一个隐藏窗口开关，避免设置互相矛盾。
                     headless=self.config.browser.headless,
-                    # 手动点播必须在综合页实际向下翻阅，不能只以首屏排序；这样既
-                    # 避开固定首屏重复，也能把后续自然结果一起交给评分器比较。
-                    require_scroll_before_return=True,
-                    minimum_results_before_return=self.config.browser.manual_douyin_min_results_before_scroll,
+                    # 首屏达到目标就不必额外下拉；不足时持续累积合格候选，直到
+                    # 达标、触底或耗尽整次命令的搜索时间预算。
+                    target_result_count=target_results,
+                    search_timeout_seconds=self.config.browser.manual_douyin_search_timeout_seconds,
+                    search_deadline_monotonic=search_deadline,
                     # 页面最先出现的少量链接可能只是导航或推荐卡。手动点播多等待数秒
                     # 让本次关键词的自然响应到齐，避免把“还在加载”误判成“没有结果”。
                     initial_result_wait_ms=4_000,
-                    min_like_count=0,
+                    min_like_count=self.config.candidate_filter.min_like_count,
                     allow_douyin_notes=self.config.candidate_filter.allow_douyin_notes,
                     max_video_duration_seconds=self.config.candidate_filter.max_video_duration_seconds,
                     allow_low_metadata_results=True,
                 )
             except DouyinSearchNoResultError as exc:
-                # 综合页没有解析结果不等同于“没有可分享的视频”。这里必须真正
-                # 切到视频页保底，不能只记录日志后再次打开综合页。
-                logger.info("手动抖音综合页没有候选，准备尝试视频页 query=%s reason=%s", query, exc)
-                try:
-                    results = await self._browser.discover_douyin_search(
-                        keyword=query,
-                        search_type="video",
-                        max_results=self.config.browser.manual_douyin_search_results,
-                        scroll_rounds=self.config.browser.manual_douyin_scroll_rounds,
-                        headless=self.config.browser.headless,
-                        require_scroll_before_return=True,
-                        minimum_results_before_return=self.config.browser.manual_douyin_min_results_before_scroll,
-                        initial_result_wait_ms=4_000,
-                        min_like_count=0,
-                        allow_douyin_notes=False,
-                        max_video_duration_seconds=self.config.candidate_filter.max_video_duration_seconds,
-                        allow_low_metadata_results=True,
-                    )
-                except DouyinSearchNoResultError as video_exc:
-                    logger.info("手动抖音视频页也没有候选 query=%s reason=%s", query, video_exc)
-                    results = []
+                # 手动点播只使用综合页：视频页的混合结果与当前标签相关性较弱，
+                # 不把它作为保底来源，避免为了凑数引入不相符的作品。
+                logger.info("手动抖音综合页没有候选，不切换视频页 query=%s reason=%s", query, exc)
+                results = []
             for item in results:
                 item["source"] = "手动·抖音"
             self._store.add_candidates(results)
@@ -2519,27 +2509,32 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     query,
                     len(excluded_urls),
                 )
-                try:
-                    extra_results = await self._browser.discover_douyin_search(
-                        keyword=query,
-                        search_type="general",
-                        # 排除已发内容后继续浏览更深的综合页，给后续自然结果留出
-                        # 进入候选池的空间；不会重复把首屏旧视频当作新候选。
-                        max_results=min(20, self.config.browser.manual_douyin_search_results * 2),
-                        scroll_rounds=max(6, self.config.browser.manual_douyin_scroll_rounds * 2),
-                        headless=self.config.browser.headless,
-                        require_scroll_before_return=True,
-                        minimum_results_before_return=self.config.browser.manual_douyin_min_results_before_scroll,
-                        initial_result_wait_ms=4_000,
-                        min_like_count=0,
-                        allow_douyin_notes=self.config.candidate_filter.allow_douyin_notes,
-                        max_video_duration_seconds=self.config.candidate_filter.max_video_duration_seconds,
-                        allow_low_metadata_results=True,
-                        excluded_urls=excluded_urls,
-                    )
-                except DouyinSearchNoResultError as exc:
-                    logger.info("手动抖音综合页补充下拉没有候选 query=%s reason=%s", query, exc)
+                remaining_seconds = max(0, int(search_deadline - asyncio.get_running_loop().time()))
+                if not remaining_seconds:
                     extra_results = []
+                else:
+                    try:
+                        extra_results = await self._browser.discover_douyin_search(
+                            keyword=query,
+                            search_type="general",
+                            # 排除已发内容后继续在综合页累计新的合格候选；仍与首轮
+                            # 共用搜索截止时间，不能因为去重而额外等待五分钟。
+                            max_results=min(20, result_limit),
+                            scroll_rounds=0,
+                            headless=self.config.browser.headless,
+                            target_result_count=target_results,
+                            search_timeout_seconds=remaining_seconds,
+                            search_deadline_monotonic=search_deadline,
+                            initial_result_wait_ms=4_000,
+                            min_like_count=self.config.candidate_filter.min_like_count,
+                            allow_douyin_notes=self.config.candidate_filter.allow_douyin_notes,
+                            max_video_duration_seconds=self.config.candidate_filter.max_video_duration_seconds,
+                            allow_low_metadata_results=True,
+                            excluded_urls=excluded_urls,
+                        )
+                    except DouyinSearchNoResultError as exc:
+                        logger.info("手动抖音综合页补充下拉没有候选 query=%s reason=%s", query, exc)
+                        extra_results = []
                 for item in extra_results:
                     item["source"] = "手动·抖音"
                 self._store.add_candidates(extra_results)

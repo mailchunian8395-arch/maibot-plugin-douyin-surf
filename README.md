@@ -266,9 +266,9 @@ candidate_inventory_resume_below = 10
 | `douyin_keywords_per_cycle` | `3` | 一轮站内搜索的标签数量。通常与 `surf.directions_per_cycle` 保持一致即可。 |
 | `auto_douyin_min_results_before_scroll` | `2` | 自动搜索首屏达到此数量后是否继续下拉的阈值。 |
 | `auto_douyin_scroll_rounds` | `4` | 自动搜索补充下拉次数。结果稳定时设低；结果不足时可降低，最大为 `4`。 |
-| `manual_douyin_search_results` | `12` | `/抖音` 手动搜索最多读取的首屏结果数。 |
-| `manual_douyin_min_results_before_scroll` | `8` | 手动搜索首屏结果少于该数值时补充下拉。 |
-| `manual_douyin_scroll_rounds` | `4` | `/抖音` 最多下拉次数。越多等待越久，也更可能遇到验证。 |
+| `manual_douyin_search_results` | `12` | `/抖音` 最多保留多少条合格候选；会自动不低于目标有效视频数。 |
+| `manual_douyin_target_results` | `10` | `/抖音` 在综合页累计到多少条合格视频后停止下拉。合格指视频、图文开关允许、时长符合上限且点赞达到候选最低点赞数。 |
+| `manual_douyin_search_timeout_seconds` | `300` | `/抖音` 整次综合页搜索的最长时长，单位秒。达到目标会立即停止；时间用尽或页面触底则用已有候选按点赞排序。 |
 | `allowed_domains` | `["douyin.com"]` | 浏览器域名白名单。通用版应保持只允许 `douyin.com`。 |
 | `login_pages` | `["https://www.douyin.com/?recommend=1"]` | `/抖音浏览器登录` 未提供 URL 时打开的推荐页列表。 |
 
@@ -318,7 +318,7 @@ candidate_inventory_resume_below = 10
 
 ### 为什么 `/抖音` 没有结果，或者打开了验证码？
 
-执行 `/抖音浏览器登录`，在插件打开的浏览器中登录并完成验证码。验证后再次发送同一条 `/抖音 <关键词>`。不要反复连续重试；可先降低 `manual_douyin_scroll_rounds`，减少页面操作次数。
+执行 `/抖音浏览器登录`，在插件打开的浏览器中登录并完成验证码。验证后再次发送同一条 `/抖音 <关键词>`。不要反复连续重试；如果页面容易触发验证，可降低 `manual_douyin_search_timeout_seconds`，缩短单次连续下拉的时间。
 
 ### 为什么候选不足？
 

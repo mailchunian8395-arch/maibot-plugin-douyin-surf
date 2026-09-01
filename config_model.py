@@ -29,7 +29,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="启用抖音冲浪与分享功能")
-    config_version: str = Field(default="1.0.9", description="配置版本")
+    config_version: str = Field(default="1.1.0", description="配置版本")
 
 
 @ui_labels(values="筛选底线", reply_style="分享文案风格")
@@ -241,8 +241,8 @@ class CommandAccessSection(PluginConfigBase):
     auto_douyin_min_results_before_scroll="自动搜索首屏最低结果",
     auto_douyin_scroll_rounds="自动搜索下拉次数",
     manual_douyin_search_results="手动搜索结果上限",
-    manual_douyin_min_results_before_scroll="手动搜索首屏最低结果",
-    manual_douyin_scroll_rounds="手动搜索下拉次数",
+    manual_douyin_target_results="手动搜索目标有效视频数",
+    manual_douyin_search_timeout_seconds="手动搜索最长秒数",
     allowed_domains="允许访问域名",
     login_pages="登录页地址",
 )
@@ -258,9 +258,9 @@ class BrowserSettings(PluginConfigBase):
     douyin_keywords_per_cycle: int = Field(default=3, ge=1, le=6, description="每轮搜索的标签数")
     auto_douyin_min_results_before_scroll: int = Field(default=2, ge=1, le=20, description="自动搜索首屏最低结果数")
     auto_douyin_scroll_rounds: int = Field(default=4, ge=1, le=4, description="自动搜索补充下拉次数")
-    manual_douyin_search_results: int = Field(default=12, ge=6, le=20, description="/抖音 首屏最大结果数")
-    manual_douyin_min_results_before_scroll: int = Field(default=8, ge=1, le=20, description="/抖音 首屏最低结果数")
-    manual_douyin_scroll_rounds: int = Field(default=4, ge=1, le=4, description="/抖音 下拉次数")
+    manual_douyin_search_results: int = Field(default=12, ge=6, le=20, description="/抖音 最多保留多少条合格候选；会自动不低于目标有效视频数")
+    manual_douyin_target_results: int = Field(default=10, ge=1, le=20, description="/抖音 在综合页累计到此数量的合格视频后停止下拉")
+    manual_douyin_search_timeout_seconds: int = Field(default=300, ge=30, le=900, description="/抖音 整次搜索允许持续下拉的最长时间；到时从已有合格候选中挑选")
     allowed_domains: list[str] = Field(default_factory=lambda: ["douyin.com"], description="允许访问的域名白名单")
     login_pages: list[str] = Field(default_factory=lambda: ["https://www.douyin.com/?recommend=1"], description="登录命令默认打开的推荐页")
 
