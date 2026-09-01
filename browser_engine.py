@@ -455,7 +455,15 @@ class DeepBrowser:
 
     async def _ensure(self, headless: bool) -> Any:
         if self._context is not None and self._headless == headless:
-            return self._context
+            try:
+                has_open_page = any(not bool(page.is_closed()) for page in self._context.pages)
+            except Exception:
+                has_open_page = False
+            if has_open_page:
+                return self._context
+            # 用户可以直接关闭可见 Chrome 窗口。此时 Playwright 仍保留旧的
+            # BrowserContext Python 对象，但已经不能 new_page；必须先显式重建。
+            logger.info("检测到插件专用浏览器已由外部关闭，正在重新创建浏览器上下文")
         await self.close()
         from playwright.async_api import async_playwright
 
@@ -500,12 +508,15 @@ class DeepBrowser:
         async with self._lock:
             if self._context is None or self._headless is not False:
                 return True
-            douyin_pages = [
-                page
-                for page in self._context.pages
-                if not bool(page.is_closed())
-                and "douyin.com" in (urlparse(str(page.url or "")).hostname or "").lower()
-            ]
+            try:
+                douyin_pages = [
+                    page
+                    for page in self._context.pages
+                    if not bool(page.is_closed())
+                    and "douyin.com" in (urlparse(str(page.url or "")).hostname or "").lower()
+                ]
+            except Exception:
+                return True
             if not douyin_pages:
                 return True
             for page in douyin_pages:
