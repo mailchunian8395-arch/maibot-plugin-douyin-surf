@@ -100,6 +100,15 @@ def build_curation_prompt(candidates: list[dict[str, Any]], *, tags: list[str], 
     )
 
 
+def _invalid_curation_response_preview(result: Any) -> str:
+    """为日志提供有限的模型输出摘要，避免非 JSON 结果长期不可诊断。"""
+
+    text = llm_text(result).replace("\n", " ").strip()
+    if not text:
+        return "<空响应>"
+    return text[:300]
+
+
 async def curate_candidates(
     ctx: Any, store: LifeStore, candidate_ids: list[int], *, values: str,
     topics: list[str], model: str, generator: Callable[[str, float, int], Awaitable[dict[str, Any]]] | None = None, manual_douyin: bool = False,
@@ -112,11 +121,34 @@ async def curate_candidates(
     del values
     prompt = build_curation_prompt(candidates, tags=topics, manual_douyin=manual_douyin)
     budget = max(1024, int(max_tokens or (1400 if manual_douyin else 2200)))
-    result = await (generator(prompt, 0.2, budget) if generator else generate_background(ctx, prompt=prompt, model=model, temperature=0.2, max_tokens=budget))
+    generate = generator or (
+        lambda request_prompt, request_temperature, request_max_tokens: generate_background(
+            ctx,
+            prompt=request_prompt,
+            model=model,
+            temperature=request_temperature,
+            max_tokens=request_max_tokens,
+        )
+    )
+    result = await generate(prompt, 0.2, budget)
     parsed = parse_json_object(llm_text(result))
+    if not isinstance(parsed.get("items") if parsed else None, list):
+        # 个别模型会在成功返回后夹带解释、Markdown 或半截文本。它不是候选
+        # 内容判断失败，因此只追加一次格式修复重试；仍失败则完整暴露给上层退避。
+        retry_prompt = (
+            f"{prompt}\n\n"
+            "上一次输出不符合格式。本次必须直接输出一个完整 JSON 对象，"
+            "首字符必须是 {，末字符必须是 }，且对象必须包含 items 数组；"
+            "不要输出 Markdown、解释、思考过程或任何额外文字。"
+        )
+        result = await generate(retry_prompt, 0.0, budget)
+        parsed = parse_json_object(llm_text(result))
     raw_items = parsed.get("items") if parsed else None
     if not isinstance(raw_items, list):
-        raise ValueError("冲浪筛选模型没有返回合法候选 JSON")
+        raise ValueError(
+            "冲浪筛选模型连续两次没有返回包含 items 数组的合法候选 JSON；"
+            f"第二次输出摘要：{_invalid_curation_response_preview(result)!r}"
+        )
     allowed_ids = {int(item["id"]) for item in candidates}
     curated: list[dict[str, Any]] = []
     for raw in raw_items:

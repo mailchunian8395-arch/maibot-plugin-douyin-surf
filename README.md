@@ -26,6 +26,9 @@
 > [!TIP]
 > 配置页直接显示中文字段名与中文说明，首次安装也能按界面完成设置；`config.toml`、日志和代码内部仍使用英文键名，便于排查与国际化维护。本 README 继续提供默认值和修改建议。
 
+> [!NOTE]
+> **v1.2.0 更新重点：**手动 `/抖音` 可选模型短评与单帧视觉核验；自动推荐流会优先收集候选、再分批筛选；自动分享支持“最短静默分钟 = 0”的即时模式；浏览器会复用登录上下文，并在意外关闭后仅重建和重试一次。登录与人机验证页面始终保留给人工操作。
+
 ## ✨ 功能速览
 
 | 能力 | 它会做什么 | 你可以怎么控制 |
@@ -115,12 +118,14 @@ flowchart LR
 
 配置分为十一部分：`plugin`、`identity`、`surf`、`direct_text_model`、`direct_vision_model`、`candidate_filter`、`sharing`、`command_access`、`browser`、`video`、`retention`。下面的“默认值”以配置模型为准；已有安装如果使用不同值，以配置页当前显示的值为准。
 
+可视化设置页会按使用场景分成“运行与自动冲浪”“分享与权限”“手动 `/抖音`”“模型与维护”四个标签页。标签页只改变展示方式，不会移动或重置 TOML 配置中的任何字段。
+
 ### 01 · `plugin` — 总开关
 
 | 字段 | 默认值 | 中文含义与修改建议 |
 | --- | --- | --- |
 | `enabled` | `false` | **插件总开关**。关闭后不会执行自动浏览或分享；建议先保持关闭完成登录和规则填写，再开启。 |
-| `config_version` | `1.0.0` | 配置结构版本。不要手动回退或随意改写；插件更新时会用它判断配置是否需要重建。 |
+| `config_version` | `1.2.0` | 配置结构版本。不要手动回退或随意改写；插件更新时会用它判断配置是否需要重建。 |
 
 ### 02 · `identity` — 筛选底线和分享口吻
 
@@ -153,9 +158,9 @@ flowchart LR
 ### 04 · 选择“自定义 API”时的直连配置
 
 > [!WARNING]
-> 仅当 `curator_model` 或 `vision_model` 下拉框选择了 **自定义 API** 时，才会使用下方对应配置。通常优先使用 MaiBot 的模型管理；直连适合希望为本插件单独使用模型的用户。
+> 仅当 `curator_model`、`vision_model`、`manual_douyin_comment_model` 或 `manual_douyin_visual_model` 下拉框选择了 **自定义 API** 时，才会使用下方对应配置。通常优先使用 MaiBot 的模型管理；直连适合希望为本插件单独使用模型的用户。
 
-`direct_text_model` 用于主筛选模型，`direct_vision_model` 用于视觉理解模型。两者字段相同；视觉模型必须支持 OpenAI 兼容的图片输入。
+`文本模型直连（筛选 / 手动短评）` 用于筛选文本模型和手动短评文本模型；`视觉模型直连（筛选 / 手动短评核验）` 用于筛选视觉模型和手动短评视觉核验。两者字段相同；视觉模型必须支持 OpenAI 兼容的图片输入。
 
 | 字段 | 作用 | 填写示例 / 建议 |
 | --- | --- | --- |
@@ -191,7 +196,7 @@ API 地址、密钥或模型名缺失时，插件会明确报错；密钥在 Web
 | 字段 | 默认值 | 中文含义与修改建议 |
 | --- | ---: | --- |
 | `enabled` | `false` | 主动分享总开关。关闭后仍可冲浪和积累候选，但绝不自动发送。 |
-| `stream_configs` | `[]` | **推荐使用**。点击“添加项目”后，选择“群聊”或“私聊”，再填写对应群号或 QQ 号；每个目标都有独立标签、时段、频率和库存。 |
+| `stream_configs` | `[]` | **推荐使用**。点击“添加项目”后，选择“群聊”或“私聊”，再填写对应群号或 QQ 号；每个目标都有独立标签、时段、频率和库存。`min_quiet_minutes` 设为 `0` 时为即时模式：不等安静窗口，若新消息抢占主动任务会恢复候选并自动重试，不计入暂缓次数。 |
 | `declined_share_cooldown_minutes` | `60` | 自动分享任务没有成功发送后，同一候选再次尝试前的等待时间。 |
 | `declined_share_max_attempts` | `2` | 同一候选连续失败/未发送多少次后，对该聊天流停止尝试。 |
 | `minimum_share_score` | `0.60` | 候选进入自动分享队列的最低分。默认兼顾内容质量与实际分享频率；内容太杂可提高到 `0.80`～`0.85`，想更严格可继续上调。 |
@@ -266,9 +271,14 @@ candidate_inventory_resume_below = 10
 | `douyin_keywords_per_cycle` | `3` | 一轮站内搜索的标签数量。通常与 `surf.directions_per_cycle` 保持一致即可。 |
 | `auto_douyin_min_results_before_scroll` | `2` | 自动搜索首屏达到此数量后是否继续下拉的阈值。 |
 | `auto_douyin_scroll_rounds` | `4` | 自动搜索补充下拉次数。结果稳定时设低；结果不足时可降低，最大为 `4`。 |
-| `manual_douyin_search_results` | `12` | `/抖音` 最多保留多少条合格候选；会自动不低于目标有效视频数。 |
+| `manual_douyin_search_results` | `12` | `/抖音` 最多保留的合格候选数；若小于目标有效视频数，会自动提高到目标数。 |
 | `manual_douyin_target_results` | `10` | `/抖音` 在综合页累计到多少条合格视频后停止下拉。合格指视频、图文开关允许、时长符合上限且点赞达到候选最低点赞数。 |
 | `manual_douyin_search_timeout_seconds` | `300` | `/抖音` 整次综合页搜索的最长时长，单位秒。达到目标会立即停止；时间用尽或页面触底则用已有候选按点赞排序。 |
+| `manual_douyin_comment_thinking_enabled` | `false` | 是否让 `/抖音` 在最终选中作品后额外调用一次文本模型生成短评。默认关闭，关闭时保持原本的本地随机短评；开启后会多读取该作品详情，因此响应会稍慢。 |
+| `manual_douyin_comment_model` | `utils` | 仅在上项开启时使用。下拉可选 MaiBot 已配置的文本任务；选择 **自定义 API** 时，到“模型与维护”填写 **文本模型直连（筛选 / 手动短评）**。 |
+| `manual_douyin_visual_check_enabled` | `false` | 仅在“手动短评使用模型思考”开启后生效。开启后会下载最终视频并抽取代表画面供视觉模型核验；下载、抽帧或视觉模型失败时，仍会继续文字短评。 |
+| `manual_douyin_visual_model` | `vlm` | 视觉核验使用的 MaiBot 任务。选择 **自定义 API** 时，到“模型与维护”填写 **视觉模型直连（筛选 / 手动短评核验）**。 |
+| `manual_douyin_visual_frame_samples` | `3` | 每次均匀抽取的代表画面数，可设 `1`～`4`；画面越多越完整，但耗时和视觉模型消耗也越高。 |
 | `allowed_domains` | `["douyin.com"]` | 浏览器域名白名单。通用版应保持只允许 `douyin.com`。 |
 | `login_pages` | `["https://www.douyin.com/?recommend=1"]` | `/抖音浏览器登录` 未提供 URL 时打开的推荐页列表。 |
 
@@ -306,7 +316,7 @@ candidate_inventory_resume_below = 10
 | 自动候选筛选 | `surf.curator_model` | 是 | 从当前 MaiBot 已配置任务下拉中选择；选择“自定义 API”时使用 `direct_text_model`。 |
 | 页面正文核验 | `surf.curator_model` | 是 | 从抖音页面中提取简短可靠摘要。 |
 | 推荐流视觉初筛、必要的视频抽帧 | `surf.vision_model` | 是 | 默认使用 `vlm`；选择“自定义 API”时使用 `direct_vision_model`。 |
-| `/抖音 <关键词>` | 不调用语言模型 | — | 直接使用抖音站内综合搜索。 |
+| `/抖音 <关键词>` | 默认不调用语言模型 | 是 | 直接使用抖音站内综合搜索和本地随机短评；开启 `browser.manual_douyin_comment_thinking_enabled` 后，只对最终作品调用一次 `browser.manual_douyin_comment_model`。可再开启视觉核验，以 `browser.manual_douyin_visual_model` 分析 1～4 张代表画面。 |
 
 ---
 

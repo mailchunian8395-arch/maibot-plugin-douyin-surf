@@ -29,7 +29,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="启用抖音冲浪与分享功能")
-    config_version: str = Field(default="1.1.6", description="配置版本")
+    config_version: str = Field(default="1.2.0", description="配置版本")
 
 
 @ui_labels(values="筛选底线", reply_style="分享文案风格")
@@ -48,8 +48,8 @@ class IdentitySection(PluginConfigBase):
     interval_minutes="扫描间隔分钟",
     directions_per_cycle="每轮标签数量",
     search_results_per_query="每标签候选数",
-    curator_model="筛选模型任务",
-    vision_model="视觉理解模型任务",
+    curator_model="筛选文本模型（自定义填“文本模型直连”）",
+    vision_model="筛选视觉模型（自定义填“视觉模型直连”）",
     retry_backoff_minutes="失败退避分钟",
     batch_cooldown_minutes="分批筛选冷却分钟",
     max_candidates_per_batch="单批候选上限",
@@ -66,8 +66,8 @@ class SurfSettings(PluginConfigBase):
     interval_minutes: int = Field(default=30, ge=5, description="普通扫描间隔分钟数")
     directions_per_cycle: int = Field(default=3, ge=1, le=10, description="每轮抽取的标签数")
     search_results_per_query: int = Field(default=2, ge=1, le=20, description="每个标签进入候选池的最大结果数")
-    curator_model: str = Field(default="utils", description="从 MaiBot 已配置任务中选择；选择“自定义 API”后使用下方直连配置", json_schema_extra={"x-widget": "select"})
-    vision_model: str = Field(default="vlm", description="识别视频截图、封面时使用的视觉模型任务；默认使用 MaiBot 的 vlm", json_schema_extra={"x-widget": "select"})
+    curator_model: str = Field(default="utils", description="从 MaiBot 已配置任务中选择", json_schema_extra={"x-widget": "select", "hint": "选“自定义 API”后，到“模型与维护”标签页填写“文本模型直连”。"})
+    vision_model: str = Field(default="vlm", description="识别视频截图、封面时使用的视觉模型任务；默认使用 MaiBot 的 vlm", json_schema_extra={"x-widget": "select", "hint": "选“自定义 API”后，到“模型与维护”标签页填写“视觉模型直连”。"})
     retry_backoff_minutes: int = Field(default=15, ge=1, description="模型失败后的退避分钟数")
     batch_cooldown_minutes: int = Field(default=10, ge=0, description="候选分批筛选的冷却分钟数")
     max_candidates_per_batch: int = Field(default=8, ge=1, le=30, description="单次交给模型的最大候选数")
@@ -85,9 +85,9 @@ class SurfSection(SurfSettings):
 
 @ui_labels(api_base_url="API 地址", api_key="API 密钥", model_name="模型名", temperature="生成温度", max_tokens="最大输出 token", timeout_seconds="请求超时（秒）", extra_json="额外 JSON 参数")
 class DirectTextModelSection(PluginConfigBase):
-    """仅在筛选模型来源选择 direct 时生效，使用 OpenAI 兼容 Chat Completions API。"""
+    """供筛选文本模型和手动短评文本模型选择“自定义 API”时填写。"""
 
-    __ui_label__ = "筛选模型直连"
+    __ui_label__ = "文本模型直连（筛选 / 手动短评）"
     __ui_icon__ = "link"
     __ui_order__ = 3
 
@@ -102,9 +102,9 @@ class DirectTextModelSection(PluginConfigBase):
 
 @ui_labels(api_base_url="API 地址", api_key="API 密钥", model_name="视觉模型名", temperature="生成温度", max_tokens="最大输出 token", timeout_seconds="请求超时（秒）", extra_json="额外 JSON 参数")
 class DirectVisionModelSection(DirectTextModelSection):
-    """仅在视觉模型来源选择 direct 时生效；所填模型必须支持 OpenAI 兼容图片输入。"""
+    """供筛选视觉模型和手动短评视觉核验选择“自定义 API”时填写；模型必须支持图片输入。"""
 
-    __ui_label__ = "视觉模型直连"
+    __ui_label__ = "视觉模型直连（筛选 / 手动短评核验）"
     __ui_icon__ = "image"
     __ui_order__ = 4
 
@@ -155,7 +155,7 @@ class ChatSharingRule(PluginConfigBase):
     enabled: bool = Field(default=True, description="启用该聊天流的自动分享")
     tags: list[str] = Field(default_factory=lambda: ["感觉至上", "二次元"], description="这个聊天流感兴趣的标签")
     active_hours: str = Field(default="09:00-23:00", description="该聊天流允许自动分享的时间段")
-    min_quiet_minutes: int = Field(default=8, ge=1, description="距离最后一条消息至少安静多少分钟后，才允许自动分享（单位：分钟）")
+    min_quiet_minutes: int = Field(default=8, ge=0, description="距离最后一条消息至少安静多少分钟后，才允许自动分享；设为 0 表示即时模式，不因新群消息暂缓（单位：分钟）")
     cooldown_hours: float = Field(default=1.0, ge=0.0833333333, description="两次自动分享的最短间隔小时数；最小 5 分钟")
     daily_limit: int = Field(default=0, ge=0, description="每天最多自动分享次数；0 为不限")
     candidate_inventory_pause_at: int = Field(default=30, ge=1, description="该聊天流候选上限")
@@ -243,6 +243,11 @@ class CommandAccessSection(PluginConfigBase):
     manual_douyin_search_results="手动搜索结果上限",
     manual_douyin_target_results="手动搜索目标有效视频数",
     manual_douyin_search_timeout_seconds="手动搜索最长秒数",
+    manual_douyin_comment_thinking_enabled="手动短评使用模型思考",
+    manual_douyin_comment_model="手动短评文本模型（自定义填“文本模型直连”）",
+    manual_douyin_visual_check_enabled="手动短评视觉核验",
+    manual_douyin_visual_model="手动短评视觉模型（自定义填“视觉模型直连”）",
+    manual_douyin_visual_frame_samples="手动短评视觉核验帧数",
     allowed_domains="允许访问域名",
     login_pages="登录页地址",
 )
@@ -261,6 +266,11 @@ class BrowserSettings(PluginConfigBase):
     manual_douyin_search_results: int = Field(default=12, ge=6, le=20, description="/抖音 最多保留多少条合格候选；会自动不低于目标有效视频数")
     manual_douyin_target_results: int = Field(default=10, ge=1, le=20, description="/抖音 在综合页累计到此数量的合格视频后停止下拉")
     manual_douyin_search_timeout_seconds: int = Field(default=300, ge=30, le=900, description="/抖音 整次搜索允许持续下拉的最长时间；到时从已有合格候选中挑选")
+    manual_douyin_comment_thinking_enabled: bool = Field(default=False, description="开启后，/抖音 只对最终选中的作品调用一次文本模型，生成有内容依据的自然短评；关闭时沿用本地随机短评")
+    manual_douyin_comment_model: str = Field(default="utils", description="开启手动短评模型思考后使用的文本模型任务", json_schema_extra={"x-widget": "select", "hint": "选“自定义 API”后，到“模型与维护”→“文本模型直连（筛选 / 手动短评）”填写地址、密钥和模型名。"})
+    manual_douyin_visual_check_enabled: bool = Field(default=False, description="开启手动短评模型思考后，可额外抽取最终视频的代表画面交给视觉模型核验；视觉失败时仍继续文字短评")
+    manual_douyin_visual_model: str = Field(default="vlm", description="手动短评视觉核验使用的模型任务", json_schema_extra={"x-widget": "select", "hint": "选“自定义 API”后，到“模型与维护”→“视觉模型直连（筛选 / 手动短评核验）”填写地址、密钥和模型名。"})
+    manual_douyin_visual_frame_samples: int = Field(default=3, ge=1, le=4, description="每次视觉核验从最终视频均匀抽取的代表画面数；更多画面更完整，但会增加下载时间和视觉模型消耗")
     allowed_domains: list[str] = Field(default_factory=lambda: ["douyin.com"], description="允许访问的域名白名单")
     login_pages: list[str] = Field(default_factory=lambda: ["https://www.douyin.com/?recommend=1"], description="登录命令默认打开的推荐页")
 
@@ -321,8 +331,8 @@ class VideoSection(VideoSettings):
     plugin="插件基础设置",
     identity="筛选与分享文案",
     surf="自动冲浪",
-    direct_text_model="筛选模型直连",
-    direct_vision_model="视觉模型直连",
+    direct_text_model="文本模型直连（筛选 / 手动短评）",
+    direct_vision_model="视觉模型直连（筛选 / 手动短评核验）",
     candidate_filter="候选筛选",
     sharing="主动分享",
     command_access="指令权限",

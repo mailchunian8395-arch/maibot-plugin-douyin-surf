@@ -34,6 +34,10 @@ _DOUYIN_AUTH_MARKERS = (
     "请选择所有符合上述描述的图片",
     "拖拽到这里",
 )
+_CLOSED_BROWSER_ERROR_MARKERS = (
+    "target page, context or browser has been closed",
+    "browser has been closed",
+)
 _DOUYIN_LIKE_PATTERN = re.compile(
     r"(?P<count>\d+(?:\.\d+)?)\s*(?P<unit>万|w)?\s*(?:个?赞|点赞)",
     re.IGNORECASE,
@@ -60,6 +64,13 @@ class DouyinSearchAuthenticationError(RuntimeError):
 
 class DouyinSearchNoResultError(RuntimeError):
     """搜索页可访问，但本轮没有解析出可用的自然作品。"""
+
+
+def _is_closed_browser_error(exc: Exception) -> bool:
+    """只识别 Playwright 明确报告的浏览器关闭，不把普通页面错误误作重试。"""
+
+    message = str(exc).lower()
+    return any(marker in message for marker in _CLOSED_BROWSER_ERROR_MARKERS)
 
 
 def _douyin_requires_authentication(page_text: str) -> bool:
@@ -314,7 +325,14 @@ async def _douyin_visible_feed_card_results(
             continue
         if like_count is not None and like_count < max(0, int(min_like_count)):
             continue
-        title = next((line for line in card_lines if keyword in line or "#" in line), "")
+        title = next(
+            (
+                line
+                for line in card_lines
+                if keyword in line or "#" in line
+            ),
+            "",
+        )
         if not title:
             title = next(
                 (
@@ -723,7 +741,7 @@ def _douyin_search_results_from_payload(
         elif any(key in value for key in ("aweme_id", "awemeId", "aweme_id_str", "awemeIdStr")):
             add_aweme(value)
         for child in value.values():
-            if isinstance(child, (dict, list)):
+            if isinstance(child, (dict, list, str)):
                 visit(child)
 
     visit(payload)
@@ -779,13 +797,16 @@ class DeepBrowser:
     async def _ensure(self, headless: bool) -> Any:
         if self._context is not None and self._headless == headless:
             try:
-                has_open_page = any(not bool(page.is_closed()) for page in self._context.pages)
+                browser = self._context.browser
+                browser_connected = browser is None or bool(browser.is_connected())
             except Exception:
-                has_open_page = False
-            if has_open_page:
+                browser_connected = False
+            if browser_connected:
+                # 临时工作页关闭后，持久化上下文可以合法地暂时没有页面；此时
+                # 仍可直接 new_page。不能把它误判为外部关闭后反复重启浏览器。
                 return self._context
             # 用户可以直接关闭可见 Chrome 窗口。此时 Playwright 仍保留旧的
-            # BrowserContext Python 对象，但已经不能 new_page；必须先显式重建。
+            # BrowserContext Python 对象，但所属 Browser 已经断开，必须重建。
             logger.info("检测到插件专用浏览器已由外部关闭，正在重新创建浏览器上下文")
         await self.close()
         from playwright.async_api import async_playwright
@@ -821,6 +842,42 @@ class DeepBrowser:
             self._playwright = None
         self._headless = None
 
+    async def _open_work_page(self, context: Any) -> Any:
+        """优先复用浏览器启动时唯一的空白页，避免可见窗口留下 about:blank。"""
+
+        try:
+            open_pages = [page for page in context.pages if not bool(page.is_closed())]
+        except Exception:
+            open_pages = []
+        if len(open_pages) == 1 and str(open_pages[0].url or "") == "about:blank":
+            return open_pages[0]
+        return await context.new_page()
+
+    async def _close_work_page(self, page: Any) -> None:
+        """关闭临时工作页，并只清理无内容的遗留标签页。
+
+        抖音登录页和图形验证页都拥有非空 URL，因此不会被此方法关闭；它们由
+        ``open_login_windows`` 与验证流程显式保留给用户操作。
+        """
+
+        if not bool(page.is_closed()):
+            await page.close()
+        context = self._context
+        if context is None:
+            return
+        try:
+            blank_pages = [
+                candidate
+                for candidate in context.pages
+                if candidate is not self._recommendation_page
+                and not bool(candidate.is_closed())
+                and str(candidate.url or "") == "about:blank"
+            ]
+        except Exception:
+            return
+        for blank_page in blank_pages:
+            await blank_page.close()
+
     async def douyin_authentication_pending(self) -> bool:
         """检查用户正在操作的可见抖音窗口是否仍显示登录或验证提示。
 
@@ -854,19 +911,38 @@ class DeepBrowser:
             return False
 
     async def close_douyin_recommendations(self) -> None:
-        """结束连续刷推荐任务时关闭专用浏览器，清理所有残留标签。"""
+        """结束连续刷推荐时只回收推荐页，不中断后续候选深读的登录上下文。"""
 
         async with self._lock:
-            await self.close()
+            page = self._recommendation_page
+            self._recommendation_page = None
+            if page is not None and not bool(page.is_closed()):
+                await page.close()
+            context = self._context
+            if context is None:
+                return
+            try:
+                blank_pages = [
+                    candidate
+                    for candidate in context.pages
+                    if not bool(candidate.is_closed()) and str(candidate.url or "") == "about:blank"
+                ]
+            except Exception:
+                # 外部关闭后的真实重建交给下一次 _ensure 统一处理，避免清理动作
+                # 再次打断正在等待人工操作的可见抖音页面。
+                return
+            for blank_page in blank_pages:
+                await blank_page.close()
 
     async def cookies_for(self, url: str) -> list[dict[str, Any]]:
         """Return logged-in cookies for a permitted URL without exposing them to logs."""
         if not self._allowed(url):
             return []
         async with self._lock:
-            context = self._context
-            if context is None:
-                context = await self._ensure(True)
+            # 上下文对象可能仍存在、但其窗口已被关闭。每次下载前都经由
+            # _ensure 检查，才能及时重建失效上下文而非静默返回空 Cookie。
+            headless = self._headless if isinstance(self._headless, bool) else True
+            context = await self._ensure(headless)
             try:
                 cookies = await context.cookies([url])
             except Exception:
@@ -887,14 +963,15 @@ class DeepBrowser:
         if not self._allowed(url):
             return {}
         async with self._lock:
-            context = self._context
-            if context is None:
-                context = await self._ensure(True)
-            page = await context.new_page()
+            # 与 cookies_for 保持一致：不要直接复用可能已经被外部关闭的
+            # BrowserContext，否则后续 new_page 会让下载流程直接失败。
+            headless = self._headless if isinstance(self._headless, bool) else True
+            context = await self._ensure(headless)
+            page = await self._open_work_page(context)
             try:
                 user_agent = await page.evaluate("navigator.userAgent")
             finally:
-                await page.close()
+                await self._close_work_page(page)
         if not isinstance(user_agent, str) or not user_agent.strip():
             return {}
         host = urlparse(url).scheme + "://" + (urlparse(url).netloc or "www.douyin.com")
@@ -1134,7 +1211,7 @@ class DeepBrowser:
             raise ValueError("页面不在深度浏览域名白名单中")
         async with self._lock:
             context = await self._ensure(headless=headless)
-            page = await context.new_page()
+            page = await self._open_work_page(context)
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 await page.wait_for_timeout(1200)
@@ -1153,7 +1230,7 @@ class DeepBrowser:
                     return {"image_base64": preview, "kind": "post_preview"}
                 return {}
             finally:
-                await page.close()
+                await self._close_work_page(page)
 
     async def capture_post_preview(self, url: str, *, headless: bool = True) -> str:
         """Capture the visible post/video area for link-plus-preview sharing."""
@@ -1161,13 +1238,13 @@ class DeepBrowser:
             raise ValueError("页面不在深度浏览域名白名单中")
         async with self._lock:
             context = await self._ensure(headless=headless)
-            page = await context.new_page()
+            page = await self._open_work_page(context)
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 await self._settle_dynamic_page(page, scroll_rounds=4, step=700, pause_ms=300)
                 return await self._capture_post_preview(page, page.url)
             finally:
-                await page.close()
+                await self._close_work_page(page)
 
     async def open_login_window(self, url: str = "https://www.douyin.com/?recommend=1") -> None:
         await self.open_login_windows([url])
@@ -1203,51 +1280,63 @@ class DeepBrowser:
         if not self._allowed(url):
             raise ValueError("页面不在深度浏览域名白名单中")
         async with self._lock:
-            context = await self._ensure(headless=headless)
-            page = await context.new_page()
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-                await page.wait_for_timeout(1200)
-                await self._settle_dynamic_page(page, scroll_rounds=8, step=900, pause_ms=350)
-                title = await page.title()
-                text = await page.locator("body").inner_text(timeout=self.timeout_ms)
-                host = (urlparse(page.url).hostname or "").lower()
-                html = await self._readable_html(page)
-                text = await asyncio.to_thread(_extract_readable_text, html, page.url, text)
-                images: list[dict[str, Any]] = []
-                image_locators = page.locator("img")
-                for index in range(min(await image_locators.count(), 40)):
-                    image = image_locators.nth(index)
-                    try:
-                        box = await image.bounding_box()
-                        if not box or box["width"] < 120 or box["height"] < 90:
+            for attempt in range(2):
+                page: Any = None
+                try:
+                    context = await self._ensure(headless=headless)
+                    page = await self._open_work_page(context)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                    await page.wait_for_timeout(1200)
+                    await self._settle_dynamic_page(page, scroll_rounds=8, step=900, pause_ms=350)
+                    title = await page.title()
+                    text = await page.locator("body").inner_text(timeout=self.timeout_ms)
+                    html = await self._readable_html(page)
+                    text = await asyncio.to_thread(_extract_readable_text, html, page.url, text)
+                    images: list[dict[str, Any]] = []
+                    image_locators = page.locator("img")
+                    for index in range(min(await image_locators.count(), 40)):
+                        image = image_locators.nth(index)
+                        try:
+                            box = await image.bounding_box()
+                            if not box or box["width"] < 120 or box["height"] < 90:
+                                continue
+                            images.append(
+                                {
+                                    "alt": str(await image.get_attribute("alt") or "").strip()[:300],
+                                    "title": str(await image.get_attribute("title") or "").strip()[:300],
+                                    "src": str(
+                                        await image.evaluate(
+                                            "el => el.currentSrc || el.dataset.src || el.dataset.original || "
+                                            "el.getAttribute('data-actualsrc') || el.src || ''"
+                                        )
+                                        or ""
+                                    ).strip()[:1000],
+                                    "width": round(float(box["width"])),
+                                    "height": round(float(box["height"])),
+                                }
+                            )
+                        except Exception:
                             continue
-                        images.append(
-                            {
-                                "alt": str(await image.get_attribute("alt") or "").strip()[:300],
-                                "title": str(await image.get_attribute("title") or "").strip()[:300],
-                                "src": str(
-                                    await image.evaluate(
-                                        "el => el.currentSrc || el.dataset.src || el.dataset.original || "
-                                        "el.getAttribute('data-actualsrc') || el.src || ''"
-                                    )
-                                    or ""
-                                ).strip()[:1000],
-                                "width": round(float(box["width"])),
-                                "height": round(float(box["height"])),
-                            }
-                        )
-                    except Exception:
+                    return {
+                        "url": page.url,
+                        "title": title.strip(),
+                        "text": text.strip()[: max(1000, int(max_chars))],
+                        "images": images,
+                        "comments": [],
+                    }
+                except Exception as exc:
+                    if attempt == 0 and _is_closed_browser_error(exc):
+                        logger.info("深度阅读时浏览器被关闭，重建上下文后重试一次 url=%s", url)
+                        await self.close()
                         continue
-                return {
-                    "url": page.url,
-                    "title": title.strip(),
-                    "text": text.strip()[: max(1000, int(max_chars))],
-                    "images": images,
-                    "comments": [],
-                }
-            finally:
-                await page.close()
+                    raise
+                finally:
+                    if page is not None:
+                        try:
+                            await self._close_work_page(page)
+                        except Exception as close_exc:
+                            if not _is_closed_browser_error(close_exc):
+                                raise
 
     async def discover_douyin_recommendations(
         self,
@@ -1274,7 +1363,7 @@ class DeepBrowser:
             context = await self._ensure(headless=headless)
             page = self._recommendation_page if keep_open else None
             if page is None or bool(page.is_closed()):
-                page = await context.new_page()
+                page = await self._open_work_page(context)
                 if keep_open:
                     self._recommendation_page = page
             keep_visible_page_for_authentication = False
@@ -1415,7 +1504,7 @@ class DeepBrowser:
                     if not keep_visible_page_for_authentication:
                         await self.close()
                 else:
-                    await page.close()
+                    await self._close_work_page(page)
 
     async def discover_douyin_search(
         self,
@@ -1456,7 +1545,7 @@ class DeepBrowser:
             raise ValueError("抖音搜索页不在深度浏览域名白名单中")
         async with self._lock:
             context = await self._ensure(headless=headless)
-            page = await context.new_page()
+            page = await self._open_work_page(context)
             # 仅当抖音明确展示登录或图形验证时，才保留可见页面给用户处理。
             # 其它所有搜索页必须在 finally 中关闭，避免持久化浏览器累积标签。
             keep_visible_page_for_authentication = False
@@ -1473,6 +1562,7 @@ class DeepBrowser:
                 # 绕过抖音的访问控制。
                 search_responses: list[Any] = []
                 diagnosed_response_urls: set[str] = set()
+                search_response_received = asyncio.Event()
 
                 def remember_search_response(response: Any) -> None:
                     response_url = str(getattr(response, "url", ""))
@@ -1482,6 +1572,7 @@ class DeepBrowser:
                     # Playwright 的 UTF-8 解码异常，因此这里严格只读取 URL。
                     if _is_douyin_search_response_url(response_url) and keyword in unquote(response_url):
                         search_responses.append(response)
+                        search_response_received.set()
 
                 # 搜索请求往往在结果页导航和懒加载阶段才发出。监听必须在导航前
                 # 挂上，并覆盖结果卡等待及滚动稳定阶段；仍然只读取页面自然发出的
@@ -1489,7 +1580,14 @@ class DeepBrowser:
                 page.on("response", remember_search_response)
                 response_listener_attached = True
                 await page.goto(search_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-                await page.wait_for_timeout(2500)
+                # 页面自然搜索响应已经包含稳定的作品 ID、互动数据和时长。首屏若
+                # 已收到它，就不必为了旧版链接/data-e2e 选择器再固定等待 2.5 秒。
+                # 没有响应时仅保留很短的缓冲，让页面能发起首个懒加载请求；后续仍由
+                # initial_result_wait_ms 和下拉逻辑处理真正较慢的灰度页面。
+                try:
+                    await asyncio.wait_for(search_response_received.wait(), timeout=0.8)
+                except asyncio.TimeoutError:
+                    pass
                 logger.info(
                     "抖音搜索页已打开 keyword=%s search_type=%s current_url=%s",
                     keyword,
@@ -1537,6 +1635,14 @@ class DeepBrowser:
                             max_video_duration_seconds=max_video_duration_seconds,
                             excluded_urls=excluded,
                         )
+                        if not response_results and response_url not in diagnosed_response_urls:
+                            logger.info(
+                                "抖音搜索响应结构诊断 keyword=%s url=%s shape=%s",
+                                keyword,
+                                response_url,
+                                _douyin_response_payload_shape(response_payload),
+                            )
+                            diagnosed_response_urls.add(response_url)
                         for item in response_results:
                             url = str(item.get("url") or "")
                             if not url or url in seen_api_urls:
@@ -1599,31 +1705,41 @@ class DeepBrowser:
                 )
                 links = page.locator(link_selector)
                 visible_video_cards = page.locator('[data-e2e="feed-video"][data-e2e-vid]')
-                try:
-                    await page.wait_for_function(
-                        """() => Boolean(
-                            document.querySelector(
-                                'a[href*="/video/"], a[href*="/note/"], '
-                                + 'a[href*="modal_id="], a[href*="aweme_id="], '
-                                + '[data-e2e="feed-video"][data-e2e-vid]'
-                            )
-                        )""",
-                        timeout=min(self.timeout_ms, 15_000),
-                    )
-                except Exception:
-                    body_text = str(await page.locator("body").inner_text(timeout=self.timeout_ms) or "")
-                    if _douyin_requires_authentication(body_text):
-                        keep_visible_page_for_authentication = not headless
-                        raise DouyinSearchAuthenticationError(
-                            "抖音搜索出现登录或图形安全验证，请在已打开的浏览器窗口完成验证后重试"
-                        )
-                    # 新版搜索结果首屏不一定以传统锚点出现；不能在这里提前判空，
-                    # 继续滚动并等待懒加载后的卡片、搜索响应或 SSR 数据。
+                if api_results:
+                    # /抖音 的综合页已从自然响应解析到合格作品时，直接进入“累计
+                    # 候选并下拉”的阶段。新版页面经常没有传统链接或 data-e2e，若
+                    # 此处仍等待旧 DOM 最多 15 秒，用户会看到页面明明有内容却不翻页。
                     logger.info(
-                        "抖音搜索首屏未出现作品链接，继续等待动态结果 keyword=%s response_count=%s",
+                        "抖音搜索首屏已有自然响应候选，跳过旧 DOM 等待 keyword=%s results=%s",
                         keyword,
-                        len(response_urls),
+                        len(api_results),
                     )
+                else:
+                    try:
+                        await page.wait_for_function(
+                            """() => Boolean(
+                                document.querySelector(
+                                    'a[href*="/video/"], a[href*="/note/"], '
+                                    + 'a[href*="modal_id="], a[href*="aweme_id="], '
+                                    + '[data-e2e="feed-video"][data-e2e-vid]'
+                                )
+                            )""",
+                            timeout=min(self.timeout_ms, 15_000),
+                        )
+                    except Exception:
+                        body_text = str(await page.locator("body").inner_text(timeout=self.timeout_ms) or "")
+                        if _douyin_requires_authentication(body_text):
+                            keep_visible_page_for_authentication = not headless
+                            raise DouyinSearchAuthenticationError(
+                                "抖音搜索出现登录或图形安全验证，请在已打开的浏览器窗口完成验证后重试"
+                            )
+                        # 新版搜索结果首屏不一定以传统锚点出现；不能在这里提前判空，
+                        # 继续滚动并等待懒加载后的卡片、搜索响应或 SSR 数据。
+                        logger.info(
+                            "抖音搜索首屏未出现作品链接，继续等待动态结果 keyword=%s response_count=%s",
+                            keyword,
+                            len(response_urls),
+                        )
                 if target_results:
                     # 手动点播以“收满合格视频数”为停止条件，而不是固定下拉次数。
                     # 首次综合页搜索和排除已发候选后的补充搜索由调用方传入同一截止时间，
@@ -1645,14 +1761,6 @@ class DeepBrowser:
                             max_video_duration_seconds=max_video_duration_seconds,
                             excluded_urls=excluded,
                         )
-                        if not response_results and response_url not in diagnosed_response_urls:
-                            logger.info(
-                                "抖音搜索响应结构诊断 keyword=%s url=%s shape=%s",
-                                keyword,
-                                response_url,
-                                _douyin_response_payload_shape(response_payload),
-                            )
-                            diagnosed_response_urls.add(response_url)
                         for item in [*api_results, *visible_card_results]:
                             url = str(item.get("url") or "").rstrip("/")
                             if url:
@@ -1842,7 +1950,7 @@ class DeepBrowser:
                 )
                 if visible_card_results:
                     logger.info(
-                        "抖音搜索通过新版可见作品卡获取候选 keyword=%s results=%s cards=%s",
+                        "抖音搜索通过新版可见视频卡获取作品 keyword=%s results=%s cards=%s",
                         keyword,
                         len(visible_card_results),
                         await visible_video_cards.count(),
@@ -1996,7 +2104,7 @@ class DeepBrowser:
                         # 上下文，避免积累搜索页或留下 about:blank 空标签。
                         await self.close()
                 else:
-                    await page.close()
+                    await self._close_work_page(page)
 
     async def capture_highlight(
         self,
@@ -2011,7 +2119,7 @@ class DeepBrowser:
             raise ValueError("页面不在深度浏览域名白名单中")
         async with self._lock:
             context = await self._ensure(headless=headless)
-            page = await context.new_page()
+            page = await self._open_work_page(context)
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 await page.wait_for_timeout(1200)
@@ -2086,4 +2194,4 @@ class DeepBrowser:
                 )
                 return base64.b64encode(screenshot).decode("ascii")
             finally:
-                await page.close()
+                await self._close_work_page(page)
