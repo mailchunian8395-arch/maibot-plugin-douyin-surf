@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 _DIRECT_API_OPTION = "自定义 API"
 
 _ITEM_ARG = "_douyin_surf_item_id"
+_SHARE_ATTEMPT_ARG = "_douyin_surf_share_attempt"
 _PENDING_MAX_AGE_SECONDS = 10 * 60
 _DOUYIN_EMPTY_PAGE_COOLDOWN_SECONDS = 3 * 60
 # AgentPlan 类视觉模型可能先消耗内部推理 token；900 容易在协议层被截断。
@@ -522,7 +523,7 @@ def _is_douyin_surf_proactive_request(items: list[Any]) -> bool:
             continue
         content = _context_item_text(item).strip()
         if re.search(
-            r"<plugin_proactive_task\b[^>]*\bplugin_id=[\"']chunian\.maibot-plugin-douyin-surf-lab[\"']",
+            r"<plugin_proactive_task\b[^>]*\bplugin_id=[\"']chunian\.maibot-plugin-douyin-surf[\"']",
             content,
             flags=re.IGNORECASE,
         ):
@@ -810,11 +811,12 @@ class DouyinSurfPlugin(MaiBotPlugin):
         self._store = LifeStore(self.ctx.paths.data_dir / "douyin_surf.sqlite3")
         self._scheduler_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
-        # 候选 ID、触发时间、该聊天流的静默分钟数。最后一项用于在新消息
-        # 抢占主动任务时区分“静默保护”与用户明确选择的即时分享模式。
-        self._pending_share: dict[str, tuple[int, float, int]] = {}
+        # 候选 ID、触发时间和不可复用的投递批次号。批次号会贯穿 Planner 与
+        # Replyer，防止旧的主动任务在候选恢复后继续发送同一作品。
+        self._pending_share: dict[str, tuple[int, float, str]] = {}
+        self._active_share_delivery_attempts: set[tuple[str, str]] = set()
         self._active_proactive_share_sessions: set[str] = set()
-        self._immediate_share_retry_streams: set[str] = set()
+        self._share_retry_streams: set[str] = set()
         self._pending_screenshot_sends: set[tuple[int, str]] = set()
         self._planner_share_context: dict[str, str] = {}
         self._inventory_replenish_task: asyncio.Task[None] | None = None
@@ -2041,11 +2043,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 "share_intent": candidate.get("share_intent", ""),
             }
             self._store.mark_share_queued(discovery_id, stream_id)
-            self._pending_share[stream_id] = (
-                discovery_id,
-                time.time(),
-                max(0, int(stream_rule.min_quiet_minutes)),
-            )
+            attempt_id = uuid.uuid4().hex
+            metadata[_SHARE_ATTEMPT_ARG] = attempt_id
+            self._pending_share[stream_id] = (discovery_id, time.time(), attempt_id)
             try:
                 await self.ctx.maisaka.proactive.trigger(
                     stream_id,
@@ -2080,8 +2080,8 @@ class DouyinSurfPlugin(MaiBotPlugin):
             reason,
         )
 
-    async def _retry_immediate_share_after_message(self, stream_id: str, discovery_id: int) -> None:
-        """即时模式被普通消息抢占后，不计失败并在当前聊天回合结束后重新触发。"""
+    async def _retry_share_after_message(self, stream_id: str, discovery_id: int) -> None:
+        """主动分享被普通消息抢占后，在当前聊天回合结束后重新触发。"""
 
         try:
             # 让宿主先完成已经到达的正常聊天回合，避免旧的主动上下文混入新消息。
@@ -2093,9 +2093,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 return
             await self._maybe_trigger_share()
         except Exception:
-            logger.exception("即时模式主动分享重试失败 item=%s stream=%s", discovery_id, stream_id)
+            logger.exception("主动分享重试失败 item=%s stream=%s", discovery_id, stream_id)
         finally:
-            self._immediate_share_retry_streams.discard(stream_id)
+            self._share_retry_streams.discard(stream_id)
 
     @HookHandler(
         "maisaka.planner.before_request",
@@ -2120,32 +2120,35 @@ class DouyinSurfPlugin(MaiBotPlugin):
             # A pending share belongs only to its synthetic proactive turn. If a
             # genuine chat turn has already arrived, never let that old item bind
             # to the human's new message.
-            stale_pending = self._pending_share.pop(session_id, None)
+            stale_pending = self._pending_share.get(session_id)
             if stale_pending is not None:
-                discovery_id, _, min_quiet_minutes = stale_pending
-                if min_quiet_minutes > 0:
-                    self._defer_declined_share(discovery_id, session_id, "被新的群消息打断")
+                discovery_id, _, attempt_id = stale_pending
+                delivery_key = (session_id, attempt_id)
+                if delivery_key in self._active_share_delivery_attempts:
+                    # 已经进入视频下载或消息发送阶段的任务不能再恢复候选；否则新
+                    # 任务可能在旧投递完成前拿到同一候选，导致连续发送两次。
                     logger.info(
-                        "已回收被新群消息打断的待分享见闻 item=%s stream=%s",
+                        "主动分享已进入实际投递，忽略新消息取消 item=%s stream=%s",
                         discovery_id,
                         session_id,
                     )
                 else:
-                    # 即时模式不把新消息当作一次拒绝：恢复候选，待当前正常消息
-                    # 处理完成后重新唤醒主动分享，且不消耗候选尝试次数。
+                    self._pending_share.pop(session_id, None)
+                    # 新消息只应延后分享，不能把已审核的候选当成用户拒绝而丢弃。
+                    # _maybe_trigger_share 会重新检查静默期、冷却和额度；满足条件后再投递。
                     self._store.restore_share_candidate(discovery_id, session_id)
-                    if session_id not in self._immediate_share_retry_streams:
-                        self._immediate_share_retry_streams.add(session_id)
+                    if session_id not in self._share_retry_streams:
+                        self._share_retry_streams.add(session_id)
                         self._track_task(
-                            self._retry_immediate_share_after_message(session_id, discovery_id)
+                            self._retry_share_after_message(session_id, discovery_id)
                         )
                     logger.info(
-                        "即时模式分享被新消息抢占，已恢复并安排重试 item=%s stream=%s",
+                        "主动分享被新消息抢占，已恢复并安排重试 item=%s stream=%s",
                         discovery_id,
                         session_id,
                     )
-            # 本插件不参与普通聊天的 Planner。只有由抖音候选触发的主动
-            # 只有主动分享任务需要注入上下文，避免影响 MaiBot 的普通聊天人格。
+            # 本插件不参与普通聊天的 Planner。只有由抖音候选触发的主动分享
+            # 任务需要注入上下文，避免影响 MaiBot 的普通聊天人格。
             return {"action": "continue"}
         context = (
             "【抖音候选自动分享】\n"
@@ -2239,6 +2242,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 )
                 reference_parts.append(item_reference)
                 arguments[_ITEM_ARG] = pending[0]
+                arguments[_SHARE_ATTEMPT_ARG] = pending[2]
                 if not _text(arguments.get("new_contribution")):
                     arguments["new_contribution"] = _text(item.get("stance"))
             arguments["reply_reference"] = "\n\n".join(part for part in reference_parts if part)
@@ -2348,18 +2352,51 @@ class DouyinSurfPlugin(MaiBotPlugin):
             item_id = 0
         if not item_id:
             return {"action": "continue"}
+        response = _text(kwargs.get("response"))
+        if not response or response.startswith("【转发自"):
+            return {"action": "continue"}
+        attempt_id = _text(arguments.get(_SHARE_ATTEMPT_ARG))
+        pending = self._pending_share.get(session_id)
+        if (
+            pending is None
+            or pending[0] != item_id
+            or not attempt_id
+            or pending[2] != attempt_id
+        ):
+            # 该 Reply 来自已经被新消息替代的旧主动任务。必须清空回复，不能
+            # 让旧任务在候选恢复并重新入队后继续投递同一条内容。
+            logger.info(
+                "已阻止过期主动分享投递 item=%s stream=%s attempt=%s",
+                item_id,
+                session_id,
+                attempt_id or "missing",
+            )
+            result = dict(kwargs)
+            result["response"] = ""
+            return {"action": "continue", "modified_kwargs": result}
+        delivery_key = (session_id, attempt_id)
+        if delivery_key in self._active_share_delivery_attempts:
+            logger.warning(
+                "已阻止同一主动分享批次的重复投递 item=%s stream=%s",
+                item_id,
+                session_id,
+            )
+            result = dict(kwargs)
+            result["response"] = ""
+            return {"action": "continue", "modified_kwargs": result}
+        # 此标记必须在第一次 await 前写入。此后即使恰好收到群消息，也让
+        # 当前唯一的一次投递完成，而不是把候选恢复并启动第二个并行任务。
+        self._active_share_delivery_attempts.add(delivery_key)
         rows = self._store.get_discoveries([item_id])
         item = rows[0] if rows else {}
         body = _text(item.get("full_text"))
         url = _text(item.get("url"))
-        response = _text(kwargs.get("response"))
-        if not response or response.startswith("【转发自"):
-            return {"action": "continue"}
         if not body or not url:
             # 主动分享的附言若没有对应来源会造成误解，因此绝不单独发送。
             # be allowed to escape as a normal chat message.
             self._defer_declined_share(item_id, session_id, "转发正文不完整")
             self._pending_share.pop(session_id, None)
+            self._active_share_delivery_attempts.discard(delivery_key)
             result = dict(kwargs)
             result["response"] = ""
             logger.error(
@@ -2636,6 +2673,16 @@ class DouyinSurfPlugin(MaiBotPlugin):
             item_id = 0
         if not item_id:
             return {"action": "continue"}
+        attempt_id = _text(arguments.get(_SHARE_ATTEMPT_ARG))
+        pending = self._pending_share.get(session_id)
+        if (
+            pending is None
+            or pending[0] != item_id
+            or not attempt_id
+            or pending[2] != attempt_id
+        ):
+            return {"action": "continue"}
+        delivery_key = (session_id, attempt_id)
         if session_id and response:
             self._store.mark_shared(item_id, session_id)
             discovery = self._store.get_discoveries([item_id])
@@ -2652,6 +2699,12 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 self._pending_screenshot_sends.add(screenshot_key)
                 self._track_task(self._send_share_screenshot(item_id, session_id, screenshot_base64))
             self._pending_share.pop(session_id, None)
+            self._active_share_delivery_attempts.discard(delivery_key)
+        elif session_id:
+            # Reply 工具被调用却没有生成正文时，不能让候选永久停留在 queued。
+            self._defer_declined_share(item_id, session_id, "Replyer 未生成可发送正文")
+            self._pending_share.pop(session_id, None)
+            self._active_share_delivery_attempts.discard(delivery_key)
         return {"action": "continue"}
 
     @EventHandler(
