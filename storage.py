@@ -664,6 +664,35 @@ class LifeStore:
             )
         return "deferred"
 
+    def defer_share_for_authentication(
+        self,
+        discovery_id: int,
+        stream_id: str,
+        *,
+        retry_after_seconds: float,
+        reason: str,
+    ) -> bool:
+        """因抖音登录态失效暂缓候选，不把它计入内容质量拒绝次数。"""
+
+        now = time.time()
+        normalized_stream_id = str(stream_id or "").strip()
+        retry_after = max(30.0, float(retry_after_seconds))
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE discovery_stream_candidates SET
+                    status='ready', queued_at=NULL, share_defer_until=?, quality_reason=?
+                WHERE discovery_id=? AND stream_id=? AND status<>'shared'
+                """,
+                (
+                    now + retry_after,
+                    f"等待抖音重新登录后重试：{str(reason)[:300]}",
+                    int(discovery_id),
+                    normalized_stream_id,
+                ),
+            )
+        return bool(cursor.rowcount)
+
     def mark_shared(self, discovery_id: int, stream_id: str) -> None:
         with self._connect() as connection:
             cursor = connection.execute(

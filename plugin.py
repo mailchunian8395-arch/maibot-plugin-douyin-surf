@@ -65,6 +65,7 @@ _SNOWLUMA_GROUP_MESSAGE_API = "adapter.napcat.message.send_group_msg"
 _VIDEO_SENDER_AUTO = "自动识别"
 _VIDEO_SENDER_NAPCAT = "NapCat"
 _VIDEO_SENDER_SNOWLUMA = "SnowLuma"
+_DOUYIN_MEDIA_AUTH_RETRY_SECONDS = 5 * 60
 # 配置 Schema 在插件生命周期的 on_load 之前就会注册。首次注册时还不能异步
 # 读取宿主任务，因此保留 MaiBot 通用任务名作为下拉保底；加载完成后会以实际
 # 已配置任务刷新缓存，供后续 Schema 请求使用。
@@ -82,6 +83,25 @@ _STANDARD_MAIBOT_MODEL_TASKS = (
     "image_search",
     "voice",
 )
+
+
+class DouyinMediaAuthenticationError(RuntimeError):
+    """抖音媒体下载被登录态或人工验证拦截。"""
+
+
+def _is_douyin_media_authentication_error(exc: Exception) -> bool:
+    """识别 yt-dlp 对抖音登录态失效给出的明确错误。"""
+
+    message = str(exc).lower()
+    markers = (
+        "fresh cookies needed",
+        "not necessarily logged in",
+        "http error 403",
+        "http 403",
+    )
+    return any(marker in message for marker in markers)
+
+
 _INTERNAL_SHARE_ANALYSIS_MARKERS = (
     "内容判断",
     "适合群聊转发",
@@ -2423,7 +2443,25 @@ class DouyinSurfPlugin(MaiBotPlugin):
             self.config.sharing.forward_body_max_chars,
         )
         is_douyin_candidate = _is_douyin_candidate(item)
-        video_forwarded = await self._forward_douyin_share_video(item_id, session_id, item)
+        try:
+            video_forwarded = await self._forward_douyin_share_video(item_id, session_id, item)
+        except DouyinMediaAuthenticationError as exc:
+            self._store.defer_share_for_authentication(
+                item_id,
+                session_id,
+                retry_after_seconds=_DOUYIN_MEDIA_AUTH_RETRY_SECONDS,
+                reason=str(exc),
+            )
+            self._pending_share.pop(session_id, None)
+            self._active_share_delivery_attempts.discard(delivery_key)
+            result["response"] = ""
+            result["skip_post_process"] = True
+            logger.warning(
+                "主动分享等待抖音重新登录后重试 item=%s stream=%s",
+                item_id,
+                session_id,
+            )
+            return {"action": "continue", "modified_kwargs": result}
         note_images_forwarded = (
             await self._forward_douyin_note_images(item_id, session_id, item)
             if is_douyin_candidate and not video_forwarded
@@ -2543,7 +2581,21 @@ class DouyinSurfPlugin(MaiBotPlugin):
         except VideoFileTooLargeError as exc:
             logger.info("抖音短视频体积过大，取消本次分享 discovery_id=%s error=%s", discovery_id, exc)
             return False
-        except Exception:
+        except Exception as exc:
+            if _is_douyin_media_authentication_error(exc):
+                logger.warning(
+                    "抖音原生视频下载需要重新登录 discovery_id=%s stream=%s error=%s",
+                    discovery_id,
+                    session_id,
+                    exc,
+                )
+                await self._request_douyin_authentication(
+                    reason="短视频下载被抖音拒绝，需要刷新登录态",
+                    url=url,
+                )
+                raise DouyinMediaAuthenticationError(
+                    "抖音视频下载要求刷新登录态或完成安全验证"
+                ) from exc
             logger.exception("抖音短视频下载或发送失败 discovery_id=%s stream=%s", discovery_id, session_id)
             return False
         self._store.mark_video_shared(discovery_id)
@@ -3077,7 +3129,12 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     continue
                 attempted_count += 1
                 comment = await self._generate_manual_douyin_comment(query, stream_id, candidate)
-                video_forwarded = await self._forward_douyin_share_video(discovery_id, stream_id, candidate)
+                try:
+                    video_forwarded = await self._forward_douyin_share_video(discovery_id, stream_id, candidate)
+                except DouyinMediaAuthenticationError:
+                    # _request_douyin_authentication 已经打开专用可见窗口并向已配置
+                    # 聊天流发出提醒。这里绝不退化为仅发链接，也不标记为已分享。
+                    return
                 note_images_forwarded = (
                     await self._forward_douyin_note_images(discovery_id, stream_id, candidate)
                     if not video_forwarded

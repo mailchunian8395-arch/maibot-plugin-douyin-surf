@@ -1275,6 +1275,7 @@ class DeepBrowser:
                     first_page = page
             if first_page is not None:
                 await first_page.bring_to_front()
+                logger.info("已打开并前置插件专用抖音浏览器 url=%s", first_page.url)
 
     async def read_page(self, url: str, *, headless: bool = True, max_chars: int = 30000) -> dict[str, Any]:
         if not self._allowed(url):
