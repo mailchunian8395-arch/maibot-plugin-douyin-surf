@@ -522,7 +522,7 @@ def _is_douyin_surf_proactive_request(items: list[Any]) -> bool:
             continue
         content = _context_item_text(item).strip()
         if re.search(
-            r"<plugin_proactive_task\b[^>]*\bplugin_id=[\"']chunian\.maibot-plugin-douyin-surf-lab[\"']",
+            r"<plugin_proactive_task\b[^>]*\bplugin_id=[\"']chunian\.maibot-plugin-douyin-surf[\"']",
             content,
             flags=re.IGNORECASE,
         ):
@@ -2123,27 +2123,20 @@ class DouyinSurfPlugin(MaiBotPlugin):
             stale_pending = self._pending_share.pop(session_id, None)
             if stale_pending is not None:
                 discovery_id, _, min_quiet_minutes = stale_pending
-                if min_quiet_minutes > 0:
-                    self._defer_declined_share(discovery_id, session_id, "被新的群消息打断")
-                    logger.info(
-                        "已回收被新群消息打断的待分享见闻 item=%s stream=%s",
-                        discovery_id,
-                        session_id,
+                # 新消息只应延后分享，不能把已审核的候选当成用户拒绝而丢弃。
+                # 重试时会重新检查静默期、冷却和额度，满足条件后再投递。
+                del min_quiet_minutes
+                self._store.restore_share_candidate(discovery_id, session_id)
+                if session_id not in self._immediate_share_retry_streams:
+                    self._immediate_share_retry_streams.add(session_id)
+                    self._track_task(
+                        self._retry_immediate_share_after_message(session_id, discovery_id)
                     )
-                else:
-                    # 即时模式不把新消息当作一次拒绝：恢复候选，待当前正常消息
-                    # 处理完成后重新唤醒主动分享，且不消耗候选尝试次数。
-                    self._store.restore_share_candidate(discovery_id, session_id)
-                    if session_id not in self._immediate_share_retry_streams:
-                        self._immediate_share_retry_streams.add(session_id)
-                        self._track_task(
-                            self._retry_immediate_share_after_message(session_id, discovery_id)
-                        )
-                    logger.info(
-                        "即时模式分享被新消息抢占，已恢复并安排重试 item=%s stream=%s",
-                        discovery_id,
-                        session_id,
-                    )
+                logger.info(
+                    "主动分享被新消息抢占，已恢复并安排重试 item=%s stream=%s",
+                    discovery_id,
+                    session_id,
+                )
             # 本插件不参与普通聊天的 Planner。只有由抖音候选触发的主动
             # 只有主动分享任务需要注入上下文，避免影响 MaiBot 的普通聊天人格。
             return {"action": "continue"}
