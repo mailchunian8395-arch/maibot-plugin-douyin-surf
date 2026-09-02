@@ -1,6 +1,6 @@
 [plugin]
 enabled = false
-config_version = "1.2.2"
+config_version = "1.2.3"
 
 [identity]
 values = "只分享来源明确、适合当前聊天环境的抖音内容。拒绝涉及明确未成年人、非自愿私密内容、违法内容、恶意引流或无法核实的夸张信息。"

@@ -1940,14 +1940,16 @@ class DouyinSurfPlugin(MaiBotPlugin):
         state_key = "douyin_authentication_prompt_until"
         now = time.time()
         prompt_retry_after = float(self._store.get_state(state_key, "0") or 0)
-        if prompt_retry_after > now:
-            return
+        should_notify = prompt_retry_after <= now
 
         # 无头上下文无法操作图形验证。切换到同一浏览器档案的可见窗口后，
         # 抖音登录态和用户完成的验证都会保留在该档案中供后续自动冲浪使用。
         authentication_url = _text(url)
         login_urls = [authentication_url] if authentication_url else list(self.config.browser.login_pages)
         await self._browser.open_login_windows(login_urls)
+        if not should_notify:
+            logger.info("再次前置插件专用抖音浏览器，人工验证提醒仍在冷却期 reason=%s", reason)
+            return
         self._store.set_state(state_key, now + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS)
 
         notice = (
