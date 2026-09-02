@@ -1,6 +1,6 @@
 [plugin]
 enabled = false
-config_version = "1.2.3"
+config_version = "1.2.4"
 
 [identity]
 values = "只分享来源明确、适合当前聊天环境的抖音内容。拒绝涉及明确未成年人、非自愿私密内容、违法内容、恶意引流或无法核实的夸张信息。"
@@ -61,7 +61,7 @@ screenshot_enabled = true
 screenshot_probability = 0.9
 screenshot_max_bytes = 5000000
 douyin_video_forward_enabled = true
-douyin_video_max_bytes = 25000000
+douyin_video_max_bytes = 16000000
 reaction_window_minutes = 120
 video_sender_adapter = "自动识别"
 

@@ -66,6 +66,9 @@ _VIDEO_SENDER_AUTO = "自动识别"
 _VIDEO_SENDER_NAPCAT = "NapCat"
 _VIDEO_SENDER_SNOWLUMA = "SnowLuma"
 _DOUYIN_MEDIA_AUTH_RETRY_SECONDS = 5 * 60
+# NapCat 与 SnowLuma 的 QQ 群消息接口均拒绝超过 16 MiB 的视频帧。
+# 留出一点余量，避免边界值因封装开销被服务端拒绝。
+_QQ_GROUP_VIDEO_MAX_BYTES = 16_000_000
 # 配置 Schema 在插件生命周期的 on_load 之前就会注册。首次注册时还不能异步
 # 读取宿主任务，因此保留 MaiBot 通用任务名作为下拉保底；加载完成后会以实际
 # 已配置任务刷新缓存，供后续 Schema 请求使用。
@@ -87,6 +90,10 @@ _STANDARD_MAIBOT_MODEL_TASKS = (
 
 class DouyinMediaAuthenticationError(RuntimeError):
     """抖音媒体下载被登录态或人工验证拦截。"""
+
+
+class DouyinMediaUnavailableError(RuntimeError):
+    """作品无法按当前 QQ 原生视频能力投递。"""
 
 
 def _is_douyin_media_authentication_error(exc: Exception) -> bool:
@@ -2464,6 +2471,19 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 session_id,
             )
             return {"action": "continue", "modified_kwargs": result}
+        except DouyinMediaUnavailableError as exc:
+            self._store.dismiss_share_candidate(item_id, session_id, reason=str(exc))
+            self._pending_share.pop(session_id, None)
+            self._active_share_delivery_attempts.discard(delivery_key)
+            result["response"] = ""
+            result["skip_post_process"] = True
+            logger.info(
+                "主动分享跳过无法发送原生视频的候选 item=%s stream=%s reason=%s",
+                item_id,
+                session_id,
+                exc,
+            )
+            return {"action": "continue", "modified_kwargs": result}
         note_images_forwarded = (
             await self._forward_douyin_note_images(item_id, session_id, item)
             if is_douyin_candidate and not video_forwarded
@@ -2523,11 +2543,19 @@ class DouyinSurfPlugin(MaiBotPlugin):
         try:
             browser_cookies = await self._browser.cookies_for(url)
             browser_headers = await self._browser.request_headers_for(url)
+            configured_max_bytes = int(self.config.sharing.douyin_video_max_bytes)
+            effective_max_bytes = min(configured_max_bytes, _QQ_GROUP_VIDEO_MAX_BYTES)
+            if configured_max_bytes > effective_max_bytes:
+                logger.info(
+                    "抖音视频发送上限受 QQ 适配器限制，使用 %s 字节而非配置的 %s 字节",
+                    effective_max_bytes,
+                    configured_max_bytes,
+                )
             downloaded = await download_short_video_for_share(
                 url,
                 self.ctx.paths.data_dir / "video-share-cache",
                 max_duration=self.config.candidate_filter.max_video_duration_seconds,
-                max_bytes=self.config.sharing.douyin_video_max_bytes,
+                max_bytes=effective_max_bytes,
                 browser_cookies=browser_cookies,
                 browser_headers=browser_headers,
             )
@@ -2578,11 +2606,13 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 )
                 return False
         except VideoDurationOutOfRangeError as exc:
-            logger.info("抖音短视频超出分享时长，取消本次分享 discovery_id=%s error=%s", discovery_id, exc)
-            return False
+            raise DouyinMediaUnavailableError(
+                f"抖音短视频时长不符合原生视频分享限制：{exc}"
+            ) from exc
         except VideoFileTooLargeError as exc:
-            logger.info("抖音短视频体积过大，取消本次分享 discovery_id=%s error=%s", discovery_id, exc)
-            return False
+            raise DouyinMediaUnavailableError(
+                f"抖音短视频超过 QQ 原生视频 16 MB 上限：{exc}"
+            ) from exc
         except Exception as exc:
             if _is_douyin_media_authentication_error(exc):
                 logger.warning(
@@ -3137,6 +3167,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     # _request_douyin_authentication 已经打开专用可见窗口并向已配置
                     # 聊天流发出提醒。这里绝不退化为仅发链接，也不标记为已分享。
                     return
+                except DouyinMediaUnavailableError as exc:
+                    logger.info("手动抖音跳过无法发送原生视频的候选 item=%s reason=%s", discovery_id, exc)
+                    continue
                 note_images_forwarded = (
                     await self._forward_douyin_note_images(discovery_id, stream_id, candidate)
                     if not video_forwarded

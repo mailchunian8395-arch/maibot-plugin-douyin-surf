@@ -693,6 +693,25 @@ class LifeStore:
             )
         return bool(cursor.rowcount)
 
+    def dismiss_share_candidate(self, discovery_id: int, stream_id: str, *, reason: str) -> bool:
+        """仅移除一个聊天流中无法投递的候选，不影响其他聊天流。"""
+
+        normalized_stream_id = str(stream_id or "").strip()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE discovery_stream_candidates SET
+                    status='dismissed', queued_at=NULL, share_defer_until=0, quality_reason=?
+                WHERE discovery_id=? AND stream_id=? AND status<>'shared'
+                """,
+                (
+                    f"无法作为 QQ 原生视频发送：{str(reason)[:300]}",
+                    int(discovery_id),
+                    normalized_stream_id,
+                ),
+            )
+        return bool(cursor.rowcount)
+
     def mark_shared(self, discovery_id: int, stream_id: str) -> None:
         with self._connect() as connection:
             cursor = connection.execute(
