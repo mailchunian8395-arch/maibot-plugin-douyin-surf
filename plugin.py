@@ -58,6 +58,9 @@ _RECOMMENDATION_VISION_MAX_TOKENS = 1400
 # 手机号登录和图形验证可能需要较长时间；等待期间绝不能重启隐藏浏览器，
 # 否则会关闭用户正在操作的可见窗口。
 _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS = 15 * 60
+# 收到下载 403 后，页面未必立即呈现登录遮罩；但用户仍需要看清前台页面并完成
+# 可能延迟出现的验证。这个最短保留时间内，后台绝不能用无头上下文接管档案。
+_DOUYIN_AUTHENTICATION_MIN_VISIBLE_SECONDS = 90
 # MaiBot 官方 NapCat 适配器公开的 QQ 群消息 API。
 _NAPCAT_GROUP_MESSAGE_API = "adapter.napcat.group.send_group_msg"
 # MaiBot 官方 SnowLuma 适配器公开的 QQ 群消息 API。
@@ -66,9 +69,9 @@ _VIDEO_SENDER_AUTO = "自动识别"
 _VIDEO_SENDER_NAPCAT = "NapCat"
 _VIDEO_SENDER_SNOWLUMA = "SnowLuma"
 _DOUYIN_MEDIA_AUTH_RETRY_SECONDS = 5 * 60
-# NapCat 与 SnowLuma 的 QQ 群消息接口均拒绝超过 16 MiB 的视频帧。
-# 留出一点余量，避免边界值因封装开销被服务端拒绝。
-_QQ_GROUP_VIDEO_MAX_BYTES = 16_000_000
+# NapCat 的 16 MiB 限制作用在整条消息帧，视频以 Base64 嵌入后会膨胀约 4/3，
+# 因而不能把原始 MP4 也放到 16 MiB。11.5 MB 原始数据可为 JSON 和段结构留余量。
+_QQ_GROUP_VIDEO_MAX_BYTES = 11_500_000
 # 配置 Schema 在插件生命周期的 on_load 之前就会注册。首次注册时还不能异步
 # 读取宿主任务，因此保留 MaiBot 通用任务名作为下拉保底；加载完成后会以实际
 # 已配置任务刷新缓存，供后续 Schema 请求使用。
@@ -842,6 +845,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
         # Replyer，防止旧的主动任务在候选恢复后继续发送同一作品。
         self._pending_share: dict[str, tuple[int, float, str]] = {}
         self._active_share_delivery_attempts: set[tuple[str, str]] = set()
+        # QQ 原生视频下载和上传可能超过宿主 Hook 的 6 秒执行预算。抖音候选
+        # 交由独立任务投递时，用此集合让后续确认 Hook 不把空回复误判为拒绝。
+        self._background_douyin_delivery_attempts: set[tuple[str, str]] = set()
         self._active_proactive_share_sessions: set[str] = set()
         self._share_retry_streams: set[str] = set()
         self._pending_screenshot_sends: set[tuple[int, str]] = set()
@@ -856,6 +862,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
         self._manual_douyin_idle.set()
         self._surf_lock = asyncio.Lock()
         self._observation_lock = asyncio.Lock()
+        # 登录提醒可能由下载、候选深读和定时任务同时触发。串行化状态读写，避免
+        # 一个协程刚打开可见窗口，另一个协程就误判验证已经结束并重启无头浏览器。
+        self._douyin_authentication_lock = asyncio.Lock()
         # 冲浪筛选和深读共用一把锁，避免后台模型请求堆积。
         self._background_llm_lock = asyncio.Lock()
         self._browser = DeepBrowser(
@@ -871,16 +880,26 @@ class DouyinSurfPlugin(MaiBotPlugin):
         if self._scheduler_task is not None:
             self._scheduler_task.cancel()
             try:
-                await self._scheduler_task
+                await asyncio.wait_for(self._scheduler_task, timeout=1.0)
             except asyncio.CancelledError:
                 pass
+            except asyncio.TimeoutError:
+                logger.warning("抖音冲浪定时任务未在卸载时限内退出，继续关闭插件")
             self._scheduler_task = None
-        for task in list(self._background_tasks):
+        background_tasks = list(self._background_tasks)
+        for task in background_tasks:
             task.cancel()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        if background_tasks:
+            # 浏览器导航、模型调用或 yt-dlp 子进程不一定会即时响应取消。宿主只给
+            # 插件关闭 5 秒，不能因为等待这些后台任务而让热重载被强制 terminate。
+            _, pending_tasks = await asyncio.wait(background_tasks, timeout=2.0)
+            if pending_tasks:
+                logger.warning("抖音冲浪后台任务未在卸载时限内退出 count=%s", len(pending_tasks))
         self._background_tasks.clear()
-        await self._browser.close()
+        try:
+            await asyncio.wait_for(self._browser.close(), timeout=1.5)
+        except asyncio.TimeoutError:
+            logger.warning("抖音专用浏览器未在卸载时限内关闭，交由宿主回收")
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
         del config_data, version
@@ -962,20 +981,31 @@ class DouyinSurfPlugin(MaiBotPlugin):
     async def _douyin_authentication_waiting(self) -> bool:
         """验证期间冻结所有后台浏览，避免无头任务关闭人工窗口。"""
 
-        state_key = "douyin_authentication_prompt_until"
-        retry_after = float(self._store.get_state(state_key, "0") or 0)
-        if retry_after <= time.time():
-            return False
-        if not await self._browser.douyin_authentication_pending():
-            self._store.set_state(state_key, 0)
-            logger.info("检测到抖音登录或安全验证已完成，解除后台浏览暂停")
-            return False
-        if not await self._browser.has_visible_douyin_window():
+        async with self._douyin_authentication_lock:
+            state_key = "douyin_authentication_prompt_until"
+            now = time.time()
+            retry_after = float(self._store.get_state(state_key, "0") or 0)
+            if retry_after <= now:
+                return False
             authentication_url = _text(self._store.get_state("douyin_authentication_url", ""))
             login_urls = [authentication_url] if authentication_url else list(self.config.browser.login_pages)
-            await self._browser.open_login_windows(login_urls)
-            logger.warning("抖音验证仍未完成，已重新打开并前置插件专用浏览器")
-        return True
+            hold_until = float(self._store.get_state("douyin_authentication_hold_until", "0") or 0)
+            if now < hold_until:
+                if not await self._browser.has_visible_douyin_window():
+                    await self._browser.open_login_windows(login_urls)
+                    logger.warning("抖音人工处理窗口未保留，已重新打开并前置")
+                # 不能仅因页面暂时没有遮罩就解除：403 对应的验证可能尚未渲染，
+                # 用户也可能正在输入手机号或处理图形验证。
+                return True
+            if not await self._browser.douyin_authentication_pending():
+                self._store.set_state(state_key, 0)
+                self._store.set_state("douyin_authentication_hold_until", 0)
+                logger.info("检测到抖音登录或安全验证已完成，解除后台浏览暂停")
+                return False
+            if not await self._browser.has_visible_douyin_window():
+                await self._browser.open_login_windows(login_urls)
+                logger.warning("抖音验证仍未完成，已重新打开并前置插件专用浏览器")
+            return True
 
     async def _replenish_candidate_inventory(self) -> None:
         """任一聊天流候选到低水位时连续刷推荐流，直到各自补到自己的上限。"""
@@ -1971,33 +2001,62 @@ class DouyinSurfPlugin(MaiBotPlugin):
         return [stream for stream in streams if self._stream_rule_for_stream(stream) is not None]
 
     async def _request_douyin_authentication(self, *, reason: str, url: str = "") -> None:
-        """打开可见验证窗口，并向已配置聊天流发送一次人工处理提醒。"""
+        """打开可见抖音页，区分真实验证与下载器接口拒绝。"""
 
-        state_key = "douyin_authentication_prompt_until"
-        now = time.time()
-        prompt_retry_after = float(self._store.get_state(state_key, "0") or 0)
-        should_notify = prompt_retry_after <= now
+        async with self._douyin_authentication_lock:
+            state_key = "douyin_authentication_prompt_until"
+            now = time.time()
+            prompt_retry_after = float(self._store.get_state(state_key, "0") or 0)
+            should_notify = prompt_retry_after <= now
 
-        # 无头上下文无法操作图形验证。切换到同一浏览器档案的可见窗口后，
-        # 抖音登录态和用户完成的验证都会保留在该档案中供后续自动冲浪使用。
-        authentication_url = _text(url)
-        login_urls = [authentication_url] if authentication_url else list(self.config.browser.login_pages)
-        self._store.set_state("douyin_authentication_url", authentication_url)
-        await self._browser.open_login_windows(login_urls)
+            # 先写入冻结状态、再创建可见页面。否则窗口创建的短暂 await 间隙里，
+            # 定时补货可能已启动无头上下文并把刚打开的人工窗口关闭。
+            authentication_url = _text(url)
+            login_urls = [authentication_url] if authentication_url else list(self.config.browser.login_pages)
+            self._store.set_state("douyin_authentication_url", authentication_url)
+            self._store.set_state(state_key, now + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS)
+            self._store.set_state(
+                "douyin_authentication_hold_until",
+                now + _DOUYIN_AUTHENTICATION_MIN_VISIBLE_SECONDS,
+            )
+            # 无头上下文无法操作图形验证。切换到同一浏览器档案的可见窗口后，
+            # 抖音登录态和用户完成的验证都会保留在该档案中供后续自动冲浪使用。
+            await self._browser.open_login_windows(login_urls)
+            requires_user_action = await self._browser.douyin_authentication_pending()
+            if not requires_user_action:
+                # yt-dlp 的 Fresh cookies 也可能是下载详情接口被拒绝，而不是网页
+                # 真正处于未登录状态。可见页面正常时不能误导用户去找不存在的验证。
+                self._store.set_state(state_key, 0)
+                self._store.set_state("douyin_authentication_hold_until", 0)
+                notice_state_key = "douyin_downloader_rejection_notice_until"
+                should_notify = (
+                    float(self._store.get_state(notice_state_key, "0") or 0) <= now
+                )
+                if should_notify:
+                    self._store.set_state(
+                        notice_state_key,
+                        now + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS,
+                    )
         if not should_notify:
-            logger.info("再次前置插件专用抖音浏览器，人工验证提醒仍在冷却期 reason=%s", reason)
+            logger.info("再次前置插件专用抖音浏览器，下载拒绝提醒仍在冷却期 reason=%s", reason)
             return
-        self._store.set_state(state_key, now + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS)
 
-        notice = (
-            "⚠️ 抖音冲浪遇到登录或图形安全验证，已自动打开插件专用浏览器。"
-            "请在弹出的抖音页面完成验证；完成后插件会自动继续冲浪。"
-        )
+        if requires_user_action:
+            notice = (
+                "⚠️ 抖音冲浪遇到登录或图形安全验证，已自动打开插件专用浏览器。"
+                "请在弹出的抖音页面完成验证；完成后插件会自动继续冲浪。"
+            )
+            logger.warning("已请求人工完成抖音验证 reason=%s", reason)
+        else:
+            notice = (
+                "⚠️ 抖音网页当前已正常登录，但视频下载接口暂时被抖音拒绝。"
+                "无需额外验证；该视频会稍后再试。"
+            )
+            logger.warning("抖音下载接口被拒绝，但可见网页未发现登录或安全验证 reason=%s", reason)
         for stream in await self._resolve_allowed_streams():
             stream_id = _text(stream.get("session_id") or stream.get("stream_id"))
             if stream_id:
                 await self.ctx.send.text(notice, stream_id)
-        logger.warning("已请求人工完成抖音验证 reason=%s", reason)
 
     async def _qq_group_id_for_stream(self, stream_id: str) -> str:
         """从已注册的真实聊天流解析 QQ 群号，绝不从哈希流 ID 猜测。"""
@@ -2482,6 +2541,25 @@ class DouyinSurfPlugin(MaiBotPlugin):
             self.config.sharing.forward_body_max_chars,
         )
         is_douyin_candidate = _is_douyin_candidate(item)
+        if is_douyin_candidate:
+            # 不能在 Reply 的阻塞 Hook 中等待下载和 QQ 上传，否则宿主会在 6 秒后
+            # 记录超时甚至熔断。清空本轮 Reply，由后台任务严格按“视频/图文在前、
+            # 短评在后”的顺序完成实际投递。
+            self._background_douyin_delivery_attempts.add(delivery_key)
+            self._track_task(
+                self._deliver_douyin_share_background(
+                    item_id,
+                    session_id,
+                    attempt_id,
+                    item,
+                    _text(result["response"]),
+                )
+            )
+            result["response"] = ""
+            result["skip_post_process"] = True
+            result["enable_splitter"] = False
+            result["enable_chinese_typo"] = False
+            return {"action": "continue", "modified_kwargs": result}
         try:
             video_forwarded = await self._forward_douyin_share_video(item_id, session_id, item)
         except DouyinMediaAuthenticationError as exc:
@@ -2549,6 +2627,75 @@ class DouyinSurfPlugin(MaiBotPlugin):
         result["enable_splitter"] = False
         result["enable_chinese_typo"] = False
         return {"action": "continue", "modified_kwargs": result}
+
+    async def _deliver_douyin_share_background(
+        self,
+        discovery_id: int,
+        session_id: str,
+        attempt_id: str,
+        item: dict[str, Any],
+        comment: str,
+    ) -> None:
+        """在 Hook 返回后投递抖音媒体与短评，避免阻塞宿主回复管线。"""
+
+        delivery_key = (session_id, attempt_id)
+        try:
+            video_forwarded = await self._forward_douyin_share_video(
+                discovery_id,
+                session_id,
+                item,
+            )
+            note_images_forwarded = (
+                await self._forward_douyin_note_images(discovery_id, session_id, item)
+                if not video_forwarded
+                else False
+            )
+            if not video_forwarded and not note_images_forwarded:
+                # 视频和图文都无法作为原生媒体发送时，仍可清晰说明来源；这里不把
+                # 下载限制伪装成一次成功的原生视频投递。
+                comment = f"{comment}\n原链接：{_text(item.get('url'))}"
+                logger.info(
+                    "抖音媒体未转发，后台发送原链接 item=%s stream=%s",
+                    discovery_id,
+                    session_id,
+                )
+            await self.ctx.send.text(comment, session_id)
+            self._store.mark_shared(discovery_id, session_id)
+            logger.info(
+                "抖音候选后台投递完成 item=%s stream=%s video=%s note_images=%s",
+                discovery_id,
+                session_id,
+                video_forwarded,
+                note_images_forwarded,
+            )
+        except DouyinMediaAuthenticationError as exc:
+            self._store.defer_share_for_authentication(
+                discovery_id,
+                session_id,
+                retry_after_seconds=_DOUYIN_MEDIA_AUTH_RETRY_SECONDS,
+                reason=str(exc),
+            )
+            logger.warning(
+                "主动分享等待抖音重新登录后重试 item=%s stream=%s",
+                discovery_id,
+                session_id,
+            )
+        except DouyinMediaUnavailableError as exc:
+            self._store.dismiss_share_candidate(discovery_id, session_id, reason=str(exc))
+            logger.info(
+                "主动分享跳过无法发送原生视频的候选 item=%s stream=%s reason=%s",
+                discovery_id,
+                session_id,
+                exc,
+            )
+        except Exception:
+            # 未知投递异常不能让候选永远停在 queued，转为短暂退避后再由调度器处理。
+            logger.exception("抖音候选后台投递失败 item=%s stream=%s", discovery_id, session_id)
+            self._defer_declined_share(discovery_id, session_id, "后台媒体投递异常")
+        finally:
+            self._pending_share.pop(session_id, None)
+            self._active_share_delivery_attempts.discard(delivery_key)
+            self._background_douyin_delivery_attempts.discard(delivery_key)
 
     async def _forward_douyin_share_video(
         self,
@@ -2628,13 +2775,12 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     reason = _text(api_result.get("message") or api_result.get("wording")) or reason
                 failure_reasons.append(f"{api_name}: {reason}")
             if not sent_by:
-                logger.error(
-                    "抖音原生视频发送被适配器拒绝 discovery_id=%s stream=%s reason=%s",
-                    discovery_id,
-                    session_id,
-                    "；".join(failure_reasons) or "未调用到可用适配器",
+                reason = "；".join(failure_reasons) or "未调用到可用适配器"
+                raise DouyinMediaUnavailableError(
+                    f"QQ 适配器拒绝原生视频：{reason}"
                 )
-                return False
+        except DouyinMediaUnavailableError:
+            raise
         except VideoDurationOutOfRangeError as exc:
             raise DouyinMediaUnavailableError(
                 f"抖音短视频时长不符合原生视频分享限制：{exc}"
@@ -2797,6 +2943,10 @@ class DouyinSurfPlugin(MaiBotPlugin):
         ):
             return {"action": "continue"}
         delivery_key = (session_id, attempt_id)
+        if delivery_key in self._background_douyin_delivery_attempts:
+            # 该条抖音分享已由后台任务接管，Hook 中的空 response 是刻意的，不能
+            # 因此把候选退避或恢复。
+            return {"action": "continue"}
         if session_id and response:
             self._store.mark_shared(item_id, session_id)
             discovery = self._store.get_discoveries([item_id])
@@ -3167,12 +3317,30 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 if "douyin.com/video/" in candidate_url:
                     browser_cookies = await self._browser.cookies_for(candidate_url)
                     browser_headers = await self._browser.request_headers_for(candidate_url)
-                    duration = await probe_video_duration(
-                        candidate_url,
-                        self.ctx.paths.data_dir / "video-duration-probe-cache",
-                        browser_cookies=browser_cookies,
-                        browser_headers=browser_headers,
-                    )
+                    try:
+                        duration = await probe_video_duration(
+                            candidate_url,
+                            self.ctx.paths.data_dir / "video-duration-probe-cache",
+                            browser_cookies=browser_cookies,
+                            browser_headers=browser_headers,
+                        )
+                    except Exception as exc:
+                        # 最终时长预检同样依赖 yt-dlp；403/Fresh cookies 与正式
+                        # 下载是同一种人工登录态问题，不能落入最外层后把英文错误
+                        # 原样发送到群聊。
+                        if _is_douyin_media_authentication_error(exc):
+                            logger.warning(
+                                "手动抖音时长预检需要重新登录 item=%s stream=%s error=%s",
+                                discovery_id,
+                                stream_id,
+                                exc,
+                            )
+                            await self._request_douyin_authentication(
+                                reason="短视频时长预检被抖音拒绝，需要刷新登录态",
+                                url=candidate_url,
+                            )
+                            return
+                        raise
                     max_duration = self.config.candidate_filter.max_video_duration_seconds
                     if duration <= 0 or duration > max_duration:
                         self._store.dismiss_discovery(
@@ -3205,6 +3373,15 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     if not video_forwarded
                     else False
                 )
+                if "douyin.com/video/" in candidate_url and not video_forwarded:
+                    # 手动 /抖音 对视频的承诺是发送原生视频；适配器或媒体下载失败时
+                    # 继续尝试下一条，不能把链接文本伪装成一次成功的视频分享。
+                    logger.info(
+                        "手动抖音视频候选未发送原生视频，继续尝试下一条 query=%s item=%s",
+                        query,
+                        discovery_id,
+                    )
+                    continue
                 if not video_forwarded and not note_images_forwarded:
                     # 媒体转发是可选增强。没有兼容 API 或下载失败时仍返回原链接，
                     # 让非 QQ 平台和纯文本安装也能正常使用 /抖音。

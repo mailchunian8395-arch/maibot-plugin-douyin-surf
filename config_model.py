@@ -29,7 +29,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="启用抖音冲浪与分享功能")
-    config_version: str = Field(default="1.2.5", description="配置版本")
+    config_version: str = Field(default="1.2.6", description="配置版本")
 
 
 @ui_labels(values="筛选底线", reply_style="分享文案风格")
@@ -195,7 +195,7 @@ class SharingSettings(PluginConfigBase):
         default="自动识别",
         description="QQ 群原生视频的发送适配器；自动识别会依次尝试 NapCat 和 SnowLuma",
     )
-    douyin_video_max_bytes: int = Field(default=16_000_000, ge=1_000_000, le=80_000_000, description="允许转发的视频最大字节数；QQ 原生视频实际最高 16000000")
+    douyin_video_max_bytes: int = Field(default=11_500_000, ge=1_000_000, le=80_000_000, description="允许转发的视频最大字节数；NapCat 的整帧限制会使视频 Base64 膨胀，QQ 群安全上限约 11500000，超过时插件会自动按此上限处理")
     reaction_window_minutes: int = Field(default=120, ge=1, description="记录分享反馈的时间窗口分钟数")
 
 

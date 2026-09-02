@@ -981,12 +981,25 @@ class DeepBrowser:
             # 与 cookies_for 保持一致：不要直接复用可能已经被外部关闭的
             # BrowserContext，否则后续 new_page 会让下载流程直接失败。
             headless = self._headless if isinstance(self._headless, bool) else True
-            context = await self._ensure(headless)
-            page = await self._open_work_page(context)
-            try:
-                user_agent = await page.evaluate("navigator.userAgent")
-            finally:
-                await self._close_work_page(page)
+            user_agent = ""
+            for attempt in range(2):
+                page: Any = None
+                try:
+                    context = await self._ensure(headless)
+                    page = await self._open_work_page(context)
+                    user_agent = await page.evaluate("navigator.userAgent")
+                    break
+                except Exception as exc:
+                    if attempt == 0 and _is_closed_browser_error(exc):
+                        # 窗口刚被外部关闭时，_ensure 的连接检查与 new_page 之间仍有
+                        # 极短竞争窗口。显式回收旧上下文后只重试一次。
+                        logger.info("读取抖音请求头时浏览器已关闭，重新创建后重试")
+                        await self.close()
+                        continue
+                    raise
+                finally:
+                    if page is not None:
+                        await self._close_work_page(page)
         if not isinstance(user_agent, str) or not user_agent.strip():
             return {}
         host = urlparse(url).scheme + "://" + (urlparse(url).netloc or "www.douyin.com")
@@ -1763,6 +1776,13 @@ class DeepBrowser:
                     collected_results: dict[str, dict[str, Any]] = {}
                     stalled_scrolls = 0
                     card_dom_diagnostics_logged = False
+                    # 偶发灰度页会先返回搜索响应，却只渲染导航与消息组件；此时
+                    # 直接判定“触底”会让 /抖音 错失同一综合页随后可用的结果。
+                    # 只在完全没有候选和任何作品卡时自然刷新一次，不切换来源页。
+                    reloaded_empty_search_page = False
+                    # 若直接访问搜索 URL 仍只得到空壳，则使用当前页已经渲染的
+                    # 搜索框重新提交一次。这会沿用网页端自己的导航和请求链路。
+                    submitted_search_query = False
                     while True:
                         api_results, response_urls = await parse_search_responses()
                         visible_card_results = await _douyin_visible_feed_card_results(
@@ -1914,6 +1934,110 @@ class DeepBrowser:
                         if not scroll_state_after_wheel and not position_changed and not card_count_changed:
                             stalled_scrolls += 1
                             if stalled_scrolls >= 2:
+                                if (
+                                    not collected_results
+                                    and not reloaded_empty_search_page
+                                    and after_card_count == 0
+                                ):
+                                    reloaded_empty_search_page = True
+                                    stalled_scrolls = 0
+                                    logger.info(
+                                        "抖音综合页仅加载空结构，刷新后继续采集 keyword=%s",
+                                        keyword,
+                                    )
+                                    await page.reload(
+                                        wait_until="domcontentloaded",
+                                        timeout=self.timeout_ms,
+                                    )
+                                    await page.wait_for_timeout(2_000)
+                                    body_text = str(
+                                        await page.locator("body").inner_text(
+                                            timeout=self.timeout_ms
+                                        )
+                                        or ""
+                                    )
+                                    if _douyin_requires_authentication(body_text):
+                                        keep_visible_page_for_authentication = not headless
+                                        raise DouyinSearchAuthenticationError(
+                                            "抖音搜索出现登录或图形安全验证，请在已打开的浏览器窗口完成验证后重试",
+                                            url=str(page.url or ""),
+                                        )
+                                    continue
+                                if (
+                                    not collected_results
+                                    and not submitted_search_query
+                                    and after_card_count == 0
+                                ):
+                                    submitted_search_query = True
+                                    stalled_scrolls = 0
+                                    search_input = page.locator(
+                                        'input[data-e2e="searchbar-input"], '
+                                        'input[placeholder*="搜索"]'
+                                    ).first
+                                    try:
+                                        if await search_input.count() == 0:
+                                            raise RuntimeError("页面未找到抖音搜索框")
+                                        await search_input.fill(keyword)
+                                        search_button = page.locator(
+                                            '[data-e2e="searchbar-button"], '
+                                            'button:has-text("搜索")'
+                                        ).first
+                                        if await search_button.count():
+                                            # 填充输入框只会触发联想接口；点击网页自身的
+                                            # 搜索按钮才会走综合搜索的实际导航与作品请求。
+                                            await search_button.click(timeout=min(self.timeout_ms, 4_000))
+                                        else:
+                                            await search_input.press("Enter")
+                                        await page.wait_for_timeout(3_000)
+                                        logger.info(
+                                            "抖音综合页空结构，已通过页面搜索控件重新提交 keyword=%s",
+                                            keyword,
+                                        )
+                                        continue
+                                    except Exception as exc:
+                                        # 空结构页的搜索按钮有时被其自身的悬浮层盖住。
+                                        # 回到已登录首页再用真实搜索控件提交，避免对
+                                        # 被遮挡的旧按钮一直等待 Playwright 默认 30 秒。
+                                        logger.info(
+                                            "抖音综合页搜索控件不可用，转首页重提 keyword=%s error=%s",
+                                            keyword,
+                                            exc,
+                                        )
+                                        try:
+                                            await page.goto(
+                                                "https://www.douyin.com/",
+                                                wait_until="domcontentloaded",
+                                                timeout=self.timeout_ms,
+                                            )
+                                            homepage_search_input = page.locator(
+                                                'input[data-e2e="searchbar-input"], '
+                                                'input[placeholder*="搜索"]'
+                                            ).first
+                                            if await homepage_search_input.count() == 0:
+                                                raise RuntimeError("抖音首页未找到搜索框")
+                                            await homepage_search_input.fill(keyword)
+                                            homepage_search_button = page.locator(
+                                                '[data-e2e="searchbar-button"], '
+                                                'button:has-text("搜索")'
+                                            ).first
+                                            if await homepage_search_button.count():
+                                                await homepage_search_button.click(
+                                                    timeout=min(self.timeout_ms, 4_000)
+                                                )
+                                            else:
+                                                await homepage_search_input.press("Enter")
+                                            await page.wait_for_timeout(3_000)
+                                            logger.info(
+                                                "抖音综合页空结构，已通过首页搜索控件重新提交 keyword=%s",
+                                                keyword,
+                                            )
+                                            continue
+                                        except Exception as homepage_exc:
+                                            logger.info(
+                                                "抖音首页搜索控件也无法重提 keyword=%s error=%s",
+                                                keyword,
+                                                homepage_exc,
+                                            )
                                 logger.info(
                                     "抖音搜索页已无更多可下拉内容 keyword=%s results=%s target=%s",
                                     keyword,
