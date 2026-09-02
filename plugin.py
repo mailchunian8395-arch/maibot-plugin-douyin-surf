@@ -959,6 +959,24 @@ class DouyinSurfPlugin(MaiBotPlugin):
         await self._manual_douyin_idle.wait()
         logger.info("手动抖音已完成，自动%s恢复", operation)
 
+    async def _douyin_authentication_waiting(self) -> bool:
+        """验证期间冻结所有后台浏览，避免无头任务关闭人工窗口。"""
+
+        state_key = "douyin_authentication_prompt_until"
+        retry_after = float(self._store.get_state(state_key, "0") or 0)
+        if retry_after <= time.time():
+            return False
+        if not await self._browser.douyin_authentication_pending():
+            self._store.set_state(state_key, 0)
+            logger.info("检测到抖音登录或安全验证已完成，解除后台浏览暂停")
+            return False
+        if not await self._browser.has_visible_douyin_window():
+            authentication_url = _text(self._store.get_state("douyin_authentication_url", ""))
+            login_urls = [authentication_url] if authentication_url else list(self.config.browser.login_pages)
+            await self._browser.open_login_windows(login_urls)
+            logger.warning("抖音验证仍未完成，已重新打开并前置插件专用浏览器")
+        return True
+
     async def _replenish_candidate_inventory(self) -> None:
         """任一聊天流候选到低水位时连续刷推荐流，直到各自补到自己的上限。"""
 
@@ -971,6 +989,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 and _within_active_hours(datetime.now(), self.config.surf.active_hours)
             ):
                 await self._wait_for_manual_douyin_completion("候选补货")
+                if await self._douyin_authentication_waiting():
+                    logger.info("抖音等待人工验证，暂停候选补货")
+                    return
                 # 深读完成前，候选尚不能计入聊天流库存。继续抓取只会让初筛队列
                 # 无限积压，反而延后第一条实际可分享内容的产生。
                 pending_observations = self._store.pending_observation_count()
@@ -1035,6 +1056,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
             # 自动分享也可能下载媒体或调用模型；用户主动的 `/抖音` 应优先完成，
             # 本分钟的定时任务会在下一次 tick 继续检查，不会丢弃候选。
             logger.info("手动抖音正在处理，本轮自动冲浪定时任务暂停")
+            return
+        if await self._douyin_authentication_waiting():
+            logger.info("抖音等待人工验证，本轮自动冲浪定时任务暂停")
             return
         recovered_queued = self._store.recover_stale_queued_shares(_PENDING_MAX_AGE_SECONDS)
         if recovered_queued:
@@ -1329,6 +1353,8 @@ class DouyinSurfPlugin(MaiBotPlugin):
     ) -> dict[str, Any]:
         if not self._enabled() or not self.config.surf.enabled:
             return {"success": False, "reason": "自主冲浪未启用"}
+        if not manual and await self._douyin_authentication_waiting():
+            return {"success": False, "reason": "抖音正在等待人工完成登录或安全验证"}
         if self._surf_lock.locked():
             if not manual:
                 return {"success": False, "reason": "已有冲浪任务正在运行"}
@@ -1517,6 +1543,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
         """串行深读一小批候选，避免每分钟只消化一条而长期堵塞分享。"""
 
         async with self._observation_lock:
+            if await self._douyin_authentication_waiting():
+                logger.info("抖音等待人工验证，暂停候选深读")
+                return
             # 浏览器和模型仍串行使用，避免并发页面、模型请求抢占同一登录档案。
             # 一轮处理三条可显著缩短候选到分享之间的等待，又不会造成突发高负载。
             pending = self._store.pending_observation(3)
@@ -1953,6 +1982,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
         # 抖音登录态和用户完成的验证都会保留在该档案中供后续自动冲浪使用。
         authentication_url = _text(url)
         login_urls = [authentication_url] if authentication_url else list(self.config.browser.login_pages)
+        self._store.set_state("douyin_authentication_url", authentication_url)
         await self._browser.open_login_windows(login_urls)
         if not should_notify:
             logger.info("再次前置插件专用抖音浏览器，人工验证提醒仍在冷却期 reason=%s", reason)

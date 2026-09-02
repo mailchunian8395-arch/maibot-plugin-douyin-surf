@@ -910,6 +910,21 @@ class DeepBrowser:
                     return True
             return False
 
+    async def has_visible_douyin_window(self) -> bool:
+        """确认当前插件上下文仍是用户可操作的可见抖音窗口。"""
+
+        async with self._lock:
+            if self._context is None or self._headless is not False:
+                return False
+            try:
+                return any(
+                    not bool(page.is_closed())
+                    and "douyin.com" in (urlparse(str(page.url or "")).hostname or "").lower()
+                    for page in self._context.pages
+                )
+            except Exception:
+                return False
+
     async def close_douyin_recommendations(self) -> None:
         """结束连续刷推荐时只回收推荐页，不中断后续候选深读的登录上下文。"""
 
