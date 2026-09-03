@@ -54,6 +54,16 @@ def _aweme(
 class DouyinSearchPayloadBasicTests(TestCase):
     """覆盖容易因网页响应字段变化而回归的硬过滤规则。"""
 
+    def test_reads_contextual_ssr_video_ids_without_legacy_aweme_key(self) -> None:
+        page_html = (
+            '<script>window.__RSC_DATA__={"videoMeta":{"content":"x",'
+            '"resource":"7677457669691511651"}}</script>'
+        )
+
+        video_ids = browser_engine._douyin_ssr_video_ids(page_html, 5)
+
+        self.assertEqual(video_ids, ["7677457669691511651"])
+
     def test_reads_duration_from_nested_video_in_milliseconds(self) -> None:
         results = browser_engine._douyin_search_results_from_payload(
             {"data": [{"aweme_info": _aweme("7412345678901234567", duration=179_900)}]},

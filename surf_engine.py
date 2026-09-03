@@ -88,13 +88,12 @@ async def generate_background(ctx: Any, *, prompt: str, model: str, temperature:
     return result
 
 
-def build_curation_prompt(candidates: list[dict[str, Any]], *, tags: list[str], manual_douyin: bool) -> str:
+def build_curation_prompt(candidates: list[dict[str, Any]], *, tags: list[str]) -> str:
     """构造短小、无角色设定的候选筛选提示词。"""
     payload = [{key: item.get(key, "") for key in ("id", "title", "snippet", "url", "published_at", "likes")} for item in candidates]
-    mode = "用户主动搜索：按相关度排序，可保留优质结果。" if manual_douyin else "自动分享：只保留适合主动转发的优质、非重复内容。"
     return (
         "你是抖音内容筛选器。只依据提供的标题、摘要和数据判断，不补充不存在的事实。\n"
-        f"标签：{json.dumps(tags, ensure_ascii=False)}\n模式：{mode}\n候选：{json.dumps(payload, ensure_ascii=False)}\n"
+        f"标签：{json.dumps(tags, ensure_ascii=False)}\n模式：自动分享；只保留适合主动转发的优质、非重复内容。\n候选：{json.dumps(payload, ensure_ascii=False)}\n"
         "逐项输出 JSON：{\"items\":[{\"id\":1,\"keep\":true,\"topic\":\"简短主题\",\"summary\":\"不超过50字\",\"reasons\":[\"理由\"],\"confidence\":0.7,\"share_score\":0.8,\"content_quality_score\":0.8,\"heat_score\":0.5,\"share_worthy\":true,\"share_intent\":\"分享角度\",\"risk_label\":\"community\"}]}。\n"
         "过滤广告、引流、标题党、明显不安全、低信息量和与标签无关内容；摘要证据不足时降低分数。只输出 JSON。"
     )
@@ -111,7 +110,7 @@ def _invalid_curation_response_preview(result: Any) -> str:
 
 async def curate_candidates(
     ctx: Any, store: LifeStore, candidate_ids: list[int], *, values: str,
-    topics: list[str], model: str, generator: Callable[[str, float, int], Awaitable[dict[str, Any]]] | None = None, manual_douyin: bool = False,
+    topics: list[str], model: str, generator: Callable[[str, float, int], Awaitable[dict[str, Any]]] | None = None,
     max_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
     """调用单个用户选择的模型筛选候选。"""
@@ -119,8 +118,8 @@ async def curate_candidates(
     if not candidates:
         return []
     del values
-    prompt = build_curation_prompt(candidates, tags=topics, manual_douyin=manual_douyin)
-    budget = max(1024, int(max_tokens or (1400 if manual_douyin else 2200)))
+    prompt = build_curation_prompt(candidates, tags=topics)
+    budget = max(1024, int(max_tokens or 2200))
     generate = generator or (
         lambda request_prompt, request_temperature, request_max_tokens: generate_background(
             ctx,
@@ -160,8 +159,6 @@ async def curate_candidates(
             continue
         if discovery_id not in allowed_ids:
             continue
-        if manual_douyin:
-            raw["keep"] = True
         store.curate_discovery(discovery_id, raw)
         raw["id"] = discovery_id
         curated.append(raw)

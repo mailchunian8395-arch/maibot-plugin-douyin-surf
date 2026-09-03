@@ -52,6 +52,10 @@ _DOUYIN_DURATION_TEXT_PATTERN = re.compile(
 _DOUYIN_SSR_AWEME_ID_PATTERN = re.compile(
     r"(?:\\?[\"'](?:aweme_id|awemeId|item_id|itemId|modal_id|modalId)\\?[\"']\s*[:=]\s*\\?[\"']?)(\d{15,22})"
 )
+_DOUYIN_SSR_CONTEXTUAL_ID_PATTERN = re.compile(
+    r"(?:aweme|item|modal|video)[^\d]{0,160}(\d{15,22})",
+    re.IGNORECASE,
+)
 
 
 class DouyinSearchAuthenticationError(RuntimeError):
@@ -64,6 +68,14 @@ class DouyinSearchAuthenticationError(RuntimeError):
 
 class DouyinSearchNoResultError(RuntimeError):
     """搜索页可访问，但本轮没有解析出可用的自然作品。"""
+
+
+class DouyinPlaybackMediaError(RuntimeError):
+    """浏览器已打开作品页，但未能取得可直接转发的媒体响应。"""
+
+
+class DouyinPlaybackMediaTooLargeError(DouyinPlaybackMediaError):
+    """浏览器播放地址返回的视频超过 QQ 可投递上限。"""
 
 
 def _is_closed_browser_error(exc: Exception) -> bool:
@@ -182,6 +194,18 @@ def _douyin_ssr_video_ids(page_html: str, max_results: int) -> list[str]:
         seen_ids.add(video_id)
         if len(result) >= max(1, int(max_results)):
             break
+    # 新版 React Server Components 有时不会保留 aweme_id 的完整键名，而是把
+    # 作品 ID 放在带 aweme/item/video 上下文的序列化片段中。仅在搜索页调用方
+    # 已确认关键词上下文时才会采用这组候选，避免把普通页面的长数字误作作品 ID。
+    if len(result) < max(1, int(max_results)):
+        for match in _DOUYIN_SSR_CONTEXTUAL_ID_PATTERN.finditer(str(page_html or "")):
+            video_id = match.group(1)
+            if video_id in seen_ids:
+                continue
+            result.append(video_id)
+            seen_ids.add(video_id)
+            if len(result) >= max(1, int(max_results)):
+                break
     return result
 
 
@@ -357,6 +381,7 @@ async def _douyin_visible_feed_card_results(
                     f"{card_text}"
                 )[:4000],
                 "date": visible_date(card_text),
+                "metrics": {"like_count": like_count},
             }
         )
         seen_ids.add(video_id)
@@ -705,6 +730,12 @@ def _douyin_search_results_from_payload(
                 "url": content_url,
                 "body": "\n".join(body_parts)[:4000],
                 "date": date,
+                "metrics": {
+                    "like_count": like_count,
+                    "comment_count": comment_count,
+                    "collect_count": collect_count,
+                    "share_count": share_count,
+                },
             }
         )
         seen_ids.add(aweme_id)
@@ -795,6 +826,9 @@ class DeepBrowser:
         return any(host == domain or host.endswith("." + domain) for domain in self.allowed_domains)
 
     async def _ensure(self, headless: bool) -> Any:
+        # 抖音的无头页面会出现与可见浏览器不同的骨架屏和卡片结构。即使旧配置
+        # 或外部调用传入 True，也统一降为可见浏览器，不能再隐式启用无头模式。
+        headless = False
         if self._context is not None and self._headless == headless:
             try:
                 browser = self._context.browser
@@ -956,7 +990,7 @@ class DeepBrowser:
         async with self._lock:
             # 上下文对象可能仍存在、但其窗口已被关闭。每次下载前都经由
             # _ensure 检查，才能及时重建失效上下文而非静默返回空 Cookie。
-            headless = self._headless if isinstance(self._headless, bool) else True
+            headless = self._headless if isinstance(self._headless, bool) else False
             context = await self._ensure(headless)
             try:
                 cookies = await context.cookies([url])
@@ -980,7 +1014,7 @@ class DeepBrowser:
         async with self._lock:
             # 与 cookies_for 保持一致：不要直接复用可能已经被外部关闭的
             # BrowserContext，否则后续 new_page 会让下载流程直接失败。
-            headless = self._headless if isinstance(self._headless, bool) else True
+            headless = self._headless if isinstance(self._headless, bool) else False
             user_agent = ""
             for attempt in range(2):
                 page: Any = None
@@ -1233,7 +1267,7 @@ class DeepBrowser:
             return ""
         return base64.b64encode(screenshot).decode("ascii")
 
-    async def capture_post_media(self, url: str, *, headless: bool = True) -> dict[str, str]:
+    async def capture_post_media(self, url: str, *, headless: bool = False) -> dict[str, str]:
         """Capture a post's visual payload, preferring an exact image over a post-card fallback."""
         if not self._allowed(url):
             raise ValueError("页面不在深度浏览域名白名单中")
@@ -1260,7 +1294,98 @@ class DeepBrowser:
             finally:
                 await self._close_work_page(page)
 
-    async def capture_post_preview(self, url: str, *, headless: bool = True) -> str:
+    async def download_douyin_playback_media(self, url: str, *, max_bytes: int) -> dict[str, Any]:
+        """从已正常渲染的抖音播放器复用媒体地址下载视频。
+
+        抖音网页播放器和 yt-dlp 的详情 JSON 接口有不同的风控策略。网页可播放而
+        详情接口 403 时，优先从页面的 ``video.currentSrc`` 或已收到的 video 响应中
+        取得 CDN 地址，并用同一浏览器上下文请求媒体，避免重复走详情解析。
+        """
+
+        parsed = urlparse(url)
+        if "douyin.com" not in (parsed.hostname or "").lower() or "/video/" not in parsed.path:
+            raise ValueError("不是可提取播放地址的抖音视频页")
+        limit = max(1, int(max_bytes))
+        async with self._lock:
+            context = await self._ensure(headless=False)
+            page = await self._open_work_page(context)
+            response_urls: list[str] = []
+
+            def remember_playback_response(response: Any) -> None:
+                try:
+                    response_url = str(response.url or "").strip()
+                    content_type = str(response.headers.get("content-type") or "").lower()
+                except Exception:
+                    return
+                looks_like_playback = (
+                    content_type.startswith("video/")
+                    or "aweme/v1/play" in response_url
+                    or "/play/" in response_url
+                )
+                if looks_like_playback and response_url.startswith(("https://", "http://")):
+                    response_urls.append(response_url)
+
+            page.on("response", remember_playback_response)
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                await page.wait_for_timeout(900)
+                video = page.locator("video").first
+                video_details = await video.evaluate(
+                    """element => {
+                        element.muted = true;
+                        void element.play().catch(() => {});
+                        return {
+                            source: element.currentSrc || element.src || '',
+                            duration: Number(element.duration || 0),
+                        };
+                    }"""
+                )
+                await page.wait_for_timeout(1_500)
+                playback_urls: list[str] = []
+                source = str((video_details or {}).get("source") or "").strip()
+                if source.startswith(("https://", "http://")):
+                    playback_urls.append(source)
+                playback_urls.extend(response_urls)
+                deduplicated_urls = list(dict.fromkeys(playback_urls))
+                if not deduplicated_urls:
+                    raise DouyinPlaybackMediaError("页面没有暴露可下载的播放器媒体地址")
+                for media_url in deduplicated_urls:
+                    try:
+                        response = await context.request.get(
+                            media_url,
+                            headers={"Referer": str(page.url)},
+                            timeout=min(self.timeout_ms, 30_000),
+                        )
+                        content_type = str(response.headers.get("content-type") or "").lower()
+                        content_length = int(response.headers.get("content-length") or 0)
+                        if not response.ok or not content_type.startswith("video/"):
+                            continue
+                        if content_length > limit:
+                            raise DouyinPlaybackMediaTooLargeError(
+                                f"播放器媒体 {content_length} 字节超过 QQ 原生视频上限 {limit} 字节"
+                            )
+                        payload = await response.body()
+                        if not payload:
+                            continue
+                        if len(payload) > limit:
+                            raise DouyinPlaybackMediaTooLargeError(
+                                f"播放器媒体 {len(payload)} 字节超过 QQ 原生视频上限 {limit} 字节"
+                            )
+                        return {
+                            "video_bytes": payload,
+                            "duration": int(float((video_details or {}).get("duration") or 0)),
+                            "media_url": media_url,
+                        }
+                    except DouyinPlaybackMediaTooLargeError:
+                        raise
+                    except Exception as exc:
+                        logger.info("浏览器播放器媒体请求失败 url=%s error=%s", media_url, exc)
+                raise DouyinPlaybackMediaError("播放器媒体地址未返回可用视频响应")
+            finally:
+                page.remove_listener("response", remember_playback_response)
+                await self._close_work_page(page)
+
+    async def capture_post_preview(self, url: str, *, headless: bool = False) -> str:
         """Capture the visible post/video area for link-plus-preview sharing."""
         if not self._allowed(url):
             raise ValueError("页面不在深度浏览域名白名单中")
@@ -1305,7 +1430,7 @@ class DeepBrowser:
                 await first_page.bring_to_front()
                 logger.info("已打开并前置插件专用抖音浏览器 url=%s", first_page.url)
 
-    async def read_page(self, url: str, *, headless: bool = True, max_chars: int = 30000) -> dict[str, Any]:
+    async def read_page(self, url: str, *, headless: bool = False, max_chars: int = 30000) -> dict[str, Any]:
         if not self._allowed(url):
             raise ValueError("页面不在深度浏览域名白名单中")
         async with self._lock:
@@ -1372,7 +1497,7 @@ class DeepBrowser:
         *,
         max_results: int = 2,
         cards_to_browse: int = 8,
-        headless: bool = True,
+        headless: bool = False,
         min_like_count: int = 0,
         min_comment_count: int = 0,
         min_collect_count: int = 0,
@@ -1542,7 +1667,7 @@ class DeepBrowser:
         search_type: str = "general",
         max_results: int = 4,
         scroll_rounds: int = 4,
-        headless: bool = True,
+        headless: bool = False,
         require_scroll_before_return: bool = False,
         minimum_results_before_return: int = 1,
         initial_result_wait_ms: int = 0,
@@ -1783,6 +1908,7 @@ class DeepBrowser:
                     # 若直接访问搜索 URL 仍只得到空壳，则使用当前页已经渲染的
                     # 搜索框重新提交一次。这会沿用网页端自己的导航和请求链路。
                     submitted_search_query = False
+                    ssr_fallback_checked = False
                     while True:
                         api_results, response_urls = await parse_search_responses()
                         visible_card_results = await _douyin_visible_feed_card_results(
@@ -1801,6 +1927,43 @@ class DeepBrowser:
                             url = str(item.get("url") or "").rstrip("/")
                             if url:
                                 collected_results.setdefault(url, item)
+                        if (
+                            not collected_results
+                            and allow_low_metadata_results
+                            and not ssr_fallback_checked
+                        ):
+                            # 这类新版综合页有大量可见作品，但不再暴露传统卡片
+                            # 属性、链接或可解析的搜索 JSON。页面已在本次关键词
+                            # 上下文中，直接读取其 SSR/RSC 中带语义上下文的作品 ID，
+                            # 让 /抖音 立即进入后续的数据评分，而不是无意义拉到底。
+                            ssr_fallback_checked = True
+                            ssr_video_ids = _douyin_ssr_video_ids(
+                                await page.content(),
+                                max_results,
+                            )
+                            for video_id in ssr_video_ids:
+                                content_url = f"https://www.douyin.com/video/{video_id}"
+                                if content_url in excluded:
+                                    continue
+                                collected_results.setdefault(
+                                    content_url,
+                                    {
+                                        "title": f"抖音 {keyword} 视频",
+                                        "url": content_url,
+                                        "body": (
+                                            f"搜索标签：{keyword}\n"
+                                            "来源：抖音综合搜索页 SSR 作品数据"
+                                        ),
+                                        "date": "",
+                                    },
+                                )
+                            if collected_results:
+                                logger.info(
+                                    "抖音综合页通过 SSR 回退立即获取作品 keyword=%s results=%s",
+                                    keyword,
+                                    len(collected_results),
+                                )
+                                return list(collected_results.values())[:max_results]
                         if not visible_card_results and not card_dom_diagnostics_logged:
                             logger.info(
                                 "抖音综合页卡片 DOM 诊断 keyword=%s diagnostic=%s",
@@ -2186,6 +2349,7 @@ class DeepBrowser:
                             "url": url,
                             "body": f"搜索标签：{keyword}\n点赞：{like_count if like_count is not None else '未读取'}\n{card_text}"[:4000],
                             "date": visible_date(card_text),
+                            "metrics": {"like_count": like_count},
                         }
                     )
                     seen_urls.add(url)
@@ -2252,7 +2416,7 @@ class DeepBrowser:
         *,
         kind: str,
         keyword: str = "",
-        headless: bool = True,
+        headless: bool = False,
     ) -> str:
         """Capture one exact comment card; never fall back to a post or body screenshot."""
         if not self._allowed(url):

@@ -62,6 +62,12 @@ def _probe_video_duration(
         "quiet": True,
         "noprogress": True,
         "noplaylist": True,
+        # 抖音详情接口被风控时，yt-dlp 的默认重试会让一次手动命令无声等待数分钟。
+        # 这里让失败尽快暴露，由上层切换到下一条数据分候选或明确告知用户。
+        "socket_timeout": 20,
+        "retries": 1,
+        "extractor_retries": 1,
+        "fragment_retries": 1,
         "logger": _YtDlpLogger(),
     }
     if browser_headers:

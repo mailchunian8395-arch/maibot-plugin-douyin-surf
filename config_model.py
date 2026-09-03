@@ -29,7 +29,7 @@ class PluginSection(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="启用抖音冲浪与分享功能")
-    config_version: str = Field(default="1.2.6", description="配置版本")
+    config_version: str = Field(default="1.2.9", description="配置版本")
 
 
 @ui_labels(values="筛选底线", reply_style="分享文案风格")
@@ -116,11 +116,10 @@ class DirectVisionModelSection(DirectTextModelSection):
     min_share_count="最低转发数",
     allow_douyin_notes="允许抖音图文",
     max_video_duration_seconds="候选视频最长秒数",
-    recent_only_enabled="启用发布时间限制",
-    recent_days="候选最近天数",
+    max_publish_age_days="候选最远天数",
 )
 class CandidateFilterSection(PluginConfigBase):
-    """综合搜索和推荐流共用的互动数据与可选时效门槛。"""
+    """综合搜索和推荐流共用的互动数据与发布时间门槛。"""
 
     __ui_label__ = "候选筛选"
     __ui_icon__ = "filter"
@@ -132,8 +131,44 @@ class CandidateFilterSection(PluginConfigBase):
     min_share_count: int = Field(default=0, ge=0, description="候选至少需要的转发数；0 为不限制")
     allow_douyin_notes: bool = Field(default=False, description="是否将抖音图文笔记纳入候选；关闭后只收录和分享视频")
     max_video_duration_seconds: int = Field(default=180, ge=1, le=3600, description="只候选不超过该时长的抖音视频；单位：秒")
-    recent_only_enabled: bool = Field(default=False, description="开启后只候选最近指定天数内发布的视频")
-    recent_days: int = Field(default=1, ge=1, description="开启发布时间限制后允许候选的最近天数")
+    max_publish_age_days: int = Field(
+        default=0,
+        ge=0,
+        description="候选距今天最多多少天；0 为不限制，30 表示只候选最近 30 天内发布的视频",
+    )
+
+
+@ui_labels(
+    like_weight="点赞权重",
+    comment_weight="评论权重",
+    collect_weight="收藏权重",
+    share_weight="转发权重",
+    recency_weight="发布日期权重",
+    ai_weight="AI 内容权重",
+    like_target="点赞满分参考值",
+    comment_target="评论满分参考值",
+    collect_target="收藏满分参考值",
+    share_target="转发满分参考值",
+    recency_window_days="发布日期满分天数",
+)
+class ScoringSection(PluginConfigBase):
+    """将抓取互动数据和深读模型判断合成为最终分享分。"""
+
+    __ui_label__ = "候选评分"
+    __ui_icon__ = "chart"
+    __ui_order__ = 4
+
+    like_weight: float = Field(default=0.18, ge=0, le=1, description="点赞子分的权重")
+    comment_weight: float = Field(default=0.12, ge=0, le=1, description="评论子分的权重")
+    collect_weight: float = Field(default=0.12, ge=0, le=1, description="收藏子分的权重")
+    share_weight: float = Field(default=0.13, ge=0, le=1, description="转发子分的权重")
+    recency_weight: float = Field(default=0.10, ge=0, le=1, description="发布日期子分的权重")
+    ai_weight: float = Field(default=0.35, ge=0, le=1, description="AI 深读内容判断的权重")
+    like_target: int = Field(default=100000, ge=1, description="达到该点赞数时点赞子分为满分；对数曲线计算")
+    comment_target: int = Field(default=10000, ge=1, description="达到该评论数时评论子分为满分；对数曲线计算")
+    collect_target: int = Field(default=10000, ge=1, description="达到该收藏数时收藏子分为满分；对数曲线计算")
+    share_target: int = Field(default=10000, ge=1, description="达到该转发数时转发子分为满分；对数曲线计算")
+    recency_window_days: int = Field(default=30, ge=1, description="当天发布为时效满分，超过该天数时效子分为 0")
 
 
 
@@ -230,7 +265,6 @@ class CommandAccessSection(PluginConfigBase):
 
 @ui_labels(
     enabled="启用抖音浏览器",
-    headless="隐藏浏览器窗口",
     page_timeout_seconds="页面超时秒数",
     max_text_chars="页面最大读取字符",
     native_site_browsing_enabled="使用登录态真实浏览",
@@ -253,7 +287,6 @@ class CommandAccessSection(PluginConfigBase):
 )
 class BrowserSettings(PluginConfigBase):
     enabled: bool = Field(default=True, description="使用插件专用 Chrome 档案浏览抖音")
-    headless: bool = Field(default=True, description="自动冲浪、/抖音搜索与页面读取是否隐藏窗口；登录命令始终显示窗口")
     page_timeout_seconds: int = Field(default=45, ge=5, description="单页面读取超时秒数")
     max_text_chars: int = Field(default=30000, ge=1000, description="单页面最多读取字符数")
     native_site_browsing_enabled: bool = Field(default=True, description="使用已登录抖音页面真实浏览")
@@ -334,6 +367,7 @@ class VideoSection(VideoSettings):
     direct_text_model="文本模型直连（筛选 / 手动短评）",
     direct_vision_model="视觉模型直连（筛选 / 手动短评核验）",
     candidate_filter="候选筛选",
+    scoring="候选评分",
     sharing="主动分享",
     command_access="指令权限",
     browser="抖音浏览器",
@@ -347,6 +381,7 @@ class DouyinSurfConfig(PluginConfigBase):
     direct_text_model: DirectTextModelSection = Field(default_factory=DirectTextModelSection)
     direct_vision_model: DirectVisionModelSection = Field(default_factory=DirectVisionModelSection)
     candidate_filter: CandidateFilterSection = Field(default_factory=CandidateFilterSection)
+    scoring: ScoringSection = Field(default_factory=ScoringSection)
     sharing: SharingSection = Field(default_factory=SharingSection)
     command_access: CommandAccessSection = Field(default_factory=CommandAccessSection)
     browser: BrowserSection = Field(default_factory=BrowserSection)

@@ -83,6 +83,7 @@ class LifeStore:
                     url TEXT NOT NULL,
                     snippet TEXT NOT NULL DEFAULT '',
                     published_at TEXT NOT NULL DEFAULT '',
+                    metrics_json TEXT NOT NULL DEFAULT '{}',
                     found_at REAL NOT NULL,
                     status TEXT NOT NULL DEFAULT 'new',
                     topic TEXT NOT NULL DEFAULT '',
@@ -92,6 +93,9 @@ class LifeStore:
                     reasons_json TEXT NOT NULL DEFAULT '[]',
                     confidence REAL NOT NULL DEFAULT 0,
                     share_score REAL NOT NULL DEFAULT 0,
+                    ai_score REAL NOT NULL DEFAULT 0,
+                    data_score REAL NOT NULL DEFAULT 0,
+                    score_breakdown_json TEXT NOT NULL DEFAULT '{}',
                     risk_label TEXT NOT NULL DEFAULT '',
                     share_intent TEXT NOT NULL DEFAULT '',
                     shared_at REAL,
@@ -164,6 +168,10 @@ class LifeStore:
                 "knowledge_eligible": "INTEGER NOT NULL DEFAULT 1",
                 "quality_reason": "TEXT NOT NULL DEFAULT ''",
                 "subject_gender": "TEXT NOT NULL DEFAULT ''",
+                "metrics_json": "TEXT NOT NULL DEFAULT '{}'",
+                "ai_score": "REAL NOT NULL DEFAULT 0",
+                "data_score": "REAL NOT NULL DEFAULT 0",
+                "score_breakdown_json": "TEXT NOT NULL DEFAULT '{}'",
             }
             for column, definition in migrations.items():
                 if column not in discovery_columns:
@@ -196,8 +204,8 @@ class LifeStore:
                 cursor = connection.execute(
                     """
                     INSERT OR IGNORE INTO discoveries(
-                        fingerprint, source, title, url, snippet, published_at, found_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        fingerprint, source, title, url, snippet, published_at, metrics_json, found_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         fingerprint,
@@ -206,6 +214,7 @@ class LifeStore:
                         url[:2000],
                         str(item.get("body") or item.get("snippet") or "").strip()[:3000],
                         str(item.get("date") or item.get("published_at") or "").strip()[:100],
+                        json.dumps(item.get("metrics") if isinstance(item.get("metrics"), dict) else {}, ensure_ascii=False),
                         now,
                     ),
                 )
@@ -372,6 +381,7 @@ class LifeStore:
                     observed_title=?, full_text=?, observed_at=?, summary=?, interesting_point=?, stance=?,
                     reasons_json=?, confidence=?, share_score=?, risk_label=?, share_intent=?,
                     knowledge_score=?, knowledge_facts_json=?, official_today=?, heat_score=?,
+                    ai_score=?, data_score=?, score_breakdown_json=?,
                     screenshot_base64=?, screenshot_kind=?, screenshot_reason=?,
                     media_urls_json=?,
                     share_eligible=?, knowledge_eligible=?, quality_reason=?, subject_gender=?
@@ -393,6 +403,9 @@ class LifeStore:
                     json.dumps([str(item) for item in facts[:30] if str(item).strip()], ensure_ascii=False),
                     1 if bool(result.get("official_today")) else 0,
                     max(0.0, min(1.0, float(result.get("heat_score") or 0))),
+                    max(0.0, min(1.0, float(result.get("ai_score") or 0))),
+                    max(0.0, min(1.0, float(result.get("data_score") or 0))),
+                    json.dumps(result.get("score_breakdown") if isinstance(result.get("score_breakdown"), dict) else {}, ensure_ascii=False),
                     str(result.get("screenshot_base64") or "").strip(),
                     str(result.get("screenshot_kind") or "").strip()[:30],
                     str(result.get("screenshot_reason") or "").strip()[:1000],

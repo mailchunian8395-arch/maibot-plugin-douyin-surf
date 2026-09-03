@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Any
+from urllib.parse import urlsplit
+
 import asyncio
 import base64
 import json
@@ -8,9 +12,6 @@ import random
 import re
 import time
 import uuid
-from datetime import datetime, timedelta
-from typing import Any
-from urllib.parse import urlsplit
 
 from maibot_sdk import Command, EventHandler, HookHandler, MaiBotPlugin
 from maibot_sdk.types import ErrorPolicy, EventType, HookMode, HookOrder
@@ -19,13 +20,13 @@ from .config_model import ChatSharingRule, DouyinSurfConfig
 from .direct_llm import generate_openai_compatible
 from .browser_engine import (
     DeepBrowser,
+    DouyinPlaybackMediaError,
+    DouyinPlaybackMediaTooLargeError,
     DouyinSearchAuthenticationError,
     DouyinSearchNoResultError,
 )
-from .quality_gate import (
-    apply_deep_quality_gate,
-    is_official_url,
-)
+from .quality_gate import apply_deep_quality_gate, is_official_url, published_within_days
+from .scoring import calculate_candidate_data_score, calculate_candidate_score
 from .storage import LifeStore
 from .surf_engine import (
     curate_candidates,
@@ -55,7 +56,7 @@ _DOUYIN_EMPTY_PAGE_COOLDOWN_SECONDS = 3 * 60
 # AgentPlan 类视觉模型可能先消耗内部推理 token；900 容易在协议层被截断。
 # 视觉初筛最终只允许短 JSON，但保留足够预算让模型完成一次完整响应。
 _RECOMMENDATION_VISION_MAX_TOKENS = 1400
-# 手机号登录和图形验证可能需要较长时间；等待期间绝不能重启隐藏浏览器，
+# 手机号登录和图形验证可能需要较长时间；等待期间绝不能重启可见浏览器，
 # 否则会关闭用户正在操作的可见窗口。
 _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS = 15 * 60
 # 收到下载 403 后，页面未必立即呈现登录遮罩；但用户仍需要看清前台页面并完成
@@ -72,6 +73,9 @@ _DOUYIN_MEDIA_AUTH_RETRY_SECONDS = 5 * 60
 # NapCat 的 16 MiB 限制作用在整条消息帧，视频以 Base64 嵌入后会膨胀约 4/3，
 # 因而不能把原始 MP4 也放到 16 MiB。11.5 MB 原始数据可为 JSON 和段结构留余量。
 _QQ_GROUP_VIDEO_MAX_BYTES = 11_500_000
+# 抖音会对无头 Chrome 返回不同的页面结构或持续骨架屏。插件统一使用可见浏览器，
+# 避免用户开启隐藏窗口后看似正常运行、实际却长期收不到可解析候选。
+_DOUYIN_BROWSER_HEADLESS = False
 # 配置 Schema 在插件生命周期的 on_load 之前就会注册。首次注册时还不能异步
 # 读取宿主任务，因此保留 MaiBot 通用任务名作为下拉保底；加载完成后会以实际
 # 已配置任务刷新缓存，供后续 Schema 请求使用。
@@ -255,23 +259,6 @@ def _is_douyin_note(item: dict[str, Any]) -> bool:
     """判断候选是否为抖音图文笔记。"""
 
     return "/note/" in _text(item.get("url")).lower()
-
-
-def _manual_douyin_result_matches_query(item: dict[str, Any], query: str) -> bool:
-    """在深读后确认手动点播候选确实属于请求标签。"""
-
-    normalized_query = re.sub(r"\s+", "", _text(query)).lower()
-    if not normalized_query:
-        return False
-    # ``snippet`` 会保留“搜索标签：<关键词>”等检索来源元数据，而 ``topic``、
-    # ``summary`` 等模型归纳字段也可能直接复述这段元数据。它们都不能作为作品
-    # 相关性的证据，否则任意搜索结果都可能因页面残留的关键词而误通过。只使用
-    # 视频页原始标题和原始内容区文本。
-    searchable_text = "".join(
-        _text(item.get(key))
-        for key in ("title", "observed_title", "full_text")
-    )
-    return normalized_query in re.sub(r"\s+", "", searchable_text).lower()
 
 
 def _page_media_urls(images: Any, max_images: int) -> list[str]:
@@ -619,26 +606,6 @@ def _within_active_hours(now: datetime, value: str) -> bool:
     return current >= start or current < end
 
 
-def _published_within_days(value: str, days: int, now: datetime) -> bool:
-    """判断明确发布时间是否落在可选的最近天数范围内。"""
-
-    text = _text(value)
-    if not text:
-        return False
-    if any(token in text.lower() for token in ("今天", "刚刚", "小时前", "分钟前", "today")):
-        return True
-    try:
-        published_at = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        try:
-            published_at = datetime.strptime(text[:10], "%Y-%m-%d")
-        except ValueError:
-            return False
-    if published_at.tzinfo is not None:
-        published_at = published_at.astimezone().replace(tzinfo=None)
-    return published_at >= now.replace(tzinfo=None) - timedelta(days=max(1, int(days)))
-
-
 def _json_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value if str(item).strip()]
@@ -650,6 +617,30 @@ def _json_list(value: Any) -> list[str]:
         if isinstance(parsed, list):
             return [str(item) for item in parsed if str(item).strip()]
     return []
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    """读取 SQLite 保存的候选互动数据。"""
+
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _candidate_video_duration_seconds(candidate: dict[str, Any]) -> int | None:
+    """复用搜索页已展示的视频时长，避免为候选评分重复请求下载详情接口。"""
+
+    for field in ("snippet", "full_text"):
+        match = re.search(r"(?:视频)?时长：\s*(\d+)\s*秒", _text(candidate.get(field)))
+        if match is not None:
+            return max(0, int(match.group(1)))
+    return None
 
 
 def _reply_style_context(reply_style: str) -> str:
@@ -933,7 +924,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
             "抖音冲浪与分享｜帮助\n"
             "\n"
             "【搜索】\n"
-            "/抖音 <关键词>：从抖音综合搜索结果中按点赞优先挑选并转发一条\n"
+            "/抖音 <关键词>：按互动量和发布时间计算数据分，挑选并转发一条\n"
             "\n"
             "【浏览器登录】\n"
             "/抖音浏览器登录 [URL]：打开本插件独立的 Chrome 档案；不带 URL 时直达抖音\n"
@@ -1148,7 +1139,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
     ) -> list[dict[str, Any]]:
         """Route a configured surf direction through the site's own pages."""
         max_results = self.config.surf.search_results_per_query
-        headless = self.config.browser.headless
+        headless = _DOUYIN_BROWSER_HEADLESS
         scroll_rounds = 4
         if source == "美图·抖音推荐":
             authentication_state_key = f"auto_douyin_authentication_until:{source}"
@@ -1167,7 +1158,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 return await self._browser.discover_douyin_recommendations(
                     max_results=self.config.browser.douyin_recommendation_candidates_per_cycle,
                     cards_to_browse=self.config.browser.douyin_recommendation_cards_per_cycle,
-                    headless=self.config.browser.headless,
+                    headless=_DOUYIN_BROWSER_HEADLESS,
                     min_like_count=self.config.candidate_filter.min_like_count,
                     min_comment_count=self.config.candidate_filter.min_comment_count,
                     min_collect_count=self.config.candidate_filter.min_collect_count,
@@ -1222,7 +1213,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
             return []
         if "抖音" in source:
             attempts = max(0, int(self.config.browser.douyin_search_retry_count)) + 1
-            douyin_headless = self.config.browser.headless
+            douyin_headless = _DOUYIN_BROWSER_HEADLESS
             authentication_state_key = f"auto_douyin_authentication_until:{source}"
             authentication_retry_after = float(self._store.get_state(authentication_state_key, "0") or 0)
             if authentication_retry_after > time.time():
@@ -1462,7 +1453,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                         recommendation_results = await self._browser.discover_douyin_recommendations(
                             max_results=self.config.browser.douyin_recommendation_candidates_per_cycle,
                             cards_to_browse=self.config.browser.douyin_recommendation_cards_per_cycle,
-                            headless=self.config.browser.headless,
+                            headless=_DOUYIN_BROWSER_HEADLESS,
                             min_like_count=self.config.candidate_filter.min_like_count,
                             min_comment_count=self.config.candidate_filter.min_comment_count,
                             min_collect_count=self.config.candidate_filter.min_collect_count,
@@ -1499,22 +1490,23 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 logger.info("已跳过白名单外或官方来源候选 count=%s", blocked_count)
             candidate_filter = self.config.candidate_filter
             eligible_results = allowed_results
-            if candidate_filter.recent_only_enabled:
+            max_publish_age_days = candidate_filter.max_publish_age_days
+            if max_publish_age_days > 0:
                 eligible_results = [
                     item
                     for item in allowed_results
-                    if _published_within_days(
+                    if published_within_days(
                         _text(item.get("published_at") or item.get("date")),
-                        candidate_filter.recent_days,
+                        max_publish_age_days,
                         datetime.now(),
                     )
                 ]
-                stale_count = len(allowed_results) - len(eligible_results)
-                if stale_count:
+                excluded_count = len(allowed_results) - len(eligible_results)
+                if excluded_count:
                     logger.info(
-                        "已跳过超过最近天数或无日期候选 count=%s days=%s",
-                        stale_count,
-                        candidate_filter.recent_days,
+                        "已跳过超过候选最远天数或发布日期未知的候选 count=%s days=%s",
+                        excluded_count,
+                        max_publish_age_days,
                     )
             inserted_ids = self._store.add_candidates(eligible_results)
             pending = self._store.pending_curation(self.config.surf.max_candidates_per_batch)
@@ -1607,14 +1599,16 @@ class DouyinSurfPlugin(MaiBotPlugin):
             page: dict[str, Any] = {}
             is_douyin_video = "douyin.com/video" in url
             if is_douyin_video:
-                browser_cookies = await self._browser.cookies_for(url)
-                browser_headers = await self._browser.request_headers_for(url)
-                duration = await probe_video_duration(
-                    url,
-                    self.ctx.paths.data_dir / "video-duration-probe-cache",
-                    browser_cookies=browser_cookies,
-                    browser_headers=browser_headers,
-                )
+                duration = _candidate_video_duration_seconds(discovery)
+                if duration is None:
+                    browser_cookies = await self._browser.cookies_for(url)
+                    browser_headers = await self._browser.request_headers_for(url)
+                    duration = await probe_video_duration(
+                        url,
+                        self.ctx.paths.data_dir / "video-duration-probe-cache",
+                        browser_cookies=browser_cookies,
+                        browser_headers=browser_headers,
+                    )
                 max_duration = self.config.candidate_filter.max_video_duration_seconds
                 if duration <= 0 or duration > max_duration:
                     self._store.dismiss_discovery(
@@ -1657,7 +1651,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     return
                 page = await self._browser.read_page(
                     url,
-                    headless=self.config.browser.headless,
+                    headless=_DOUYIN_BROWSER_HEADLESS,
                     max_chars=self.config.browser.max_text_chars,
                 )
                 observed_title = _text(page.get("title")) or _text(discovery.get("title"))
@@ -1714,7 +1708,22 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 return
             official_today = bool(gate["official_today"])
             heat_score = float(gate["heat_score"])
-            share_score = float(gate["share_score"])
+            score_breakdown = calculate_candidate_score(
+                metrics=_json_dict(discovery.get("metrics_json")),
+                published_at=_text(discovery.get("published_at")),
+                ai_score=gate["share_score"],
+                settings=self.config.scoring,
+                now=datetime.now(),
+            )
+            share_score = float(score_breakdown["score"])
+            logger.info(
+                "候选综合评分 item=%s final=%.3f ai=%.3f data=%.3f age_days=%s",
+                discovery_id,
+                share_score,
+                float(score_breakdown["ai_score"]),
+                float(score_breakdown["data_score"]),
+                score_breakdown["age_days"],
+            )
             risk_label = (_text(parsed.get("risk_label")) or _text(curated.get("risk_label"))).lower()
             screenshot_kind = _text(parsed.get("screenshot_kind")).lower()
             screenshot_reason = _text(parsed.get("screenshot_reason"))
@@ -1728,7 +1737,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 try:
                     post_media = await self._browser.capture_post_media(
                         url,
-                        headless=self.config.browser.headless,
+                        headless=_DOUYIN_BROWSER_HEADLESS,
                     )
                 except Exception as exc:
                     logger.info("帖子主图抓取失败 url=%s error=%s", url, exc)
@@ -1751,7 +1760,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                         url,
                         kind="comment",
                         keyword=_text(parsed.get("screenshot_keyword")),
-                        headless=self.config.browser.headless,
+                        headless=_DOUYIN_BROWSER_HEADLESS,
                     )
                     estimated_bytes = len(screenshot_base64) * 3 // 4
                     if estimated_bytes > max(100_000, int(self.config.sharing.screenshot_max_bytes)):
@@ -1772,6 +1781,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 "reasons": parsed.get("reasons") if isinstance(parsed.get("reasons"), list) else [],
                 "confidence": _score(parsed.get("confidence"), _score(curated.get("confidence"), 0.6)),
                 "share_score": share_score,
+                "ai_score": score_breakdown["ai_score"],
+                "data_score": score_breakdown["data_score"],
+                "score_breakdown": score_breakdown,
                 "risk_label": risk_label,
                 "share_intent": _text(parsed.get("share_intent")) or _text(curated.get("share_intent")),
                 "official_today": official_today,
@@ -2008,21 +2020,13 @@ class DouyinSurfPlugin(MaiBotPlugin):
             now = time.time()
             prompt_retry_after = float(self._store.get_state(state_key, "0") or 0)
             should_notify = prompt_retry_after <= now
+            # 先检查当前可见页面。网页内容正常时，Fresh cookies 只是 yt-dlp
+            # 的详情接口被拦截，绝不能为了“验证”再额外弹出一个浏览器窗口。
+            requires_user_action = await self._browser.douyin_authentication_pending()
+            had_visible_window = await self._browser.has_visible_douyin_window()
 
-            # 先写入冻结状态、再创建可见页面。否则窗口创建的短暂 await 间隙里，
-            # 定时补货可能已启动无头上下文并把刚打开的人工窗口关闭。
             authentication_url = _text(url)
             login_urls = [authentication_url] if authentication_url else list(self.config.browser.login_pages)
-            self._store.set_state("douyin_authentication_url", authentication_url)
-            self._store.set_state(state_key, now + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS)
-            self._store.set_state(
-                "douyin_authentication_hold_until",
-                now + _DOUYIN_AUTHENTICATION_MIN_VISIBLE_SECONDS,
-            )
-            # 无头上下文无法操作图形验证。切换到同一浏览器档案的可见窗口后，
-            # 抖音登录态和用户完成的验证都会保留在该档案中供后续自动冲浪使用。
-            await self._browser.open_login_windows(login_urls)
-            requires_user_action = await self._browser.douyin_authentication_pending()
             if not requires_user_action:
                 # yt-dlp 的 Fresh cookies 也可能是下载详情接口被拒绝，而不是网页
                 # 真正处于未登录状态。可见页面正常时不能误导用户去找不存在的验证。
@@ -2037,6 +2041,35 @@ class DouyinSurfPlugin(MaiBotPlugin):
                         notice_state_key,
                         now + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS,
                     )
+            else:
+                # 先写入冻结状态、再创建可见页面。否则窗口创建的短暂 await 间隙里，
+                # 定时补货可能已启动浏览器上下文并把刚打开的人工窗口关闭。
+                self._store.set_state("douyin_authentication_url", authentication_url)
+                self._store.set_state(state_key, now + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS)
+                self._store.set_state(
+                    "douyin_authentication_hold_until",
+                    now + _DOUYIN_AUTHENTICATION_MIN_VISIBLE_SECONDS,
+                )
+                # 无头上下文无法操作图形验证。切换到同一浏览器档案的可见窗口后，
+                # 抖音登录态和用户完成的验证都会保留在该档案中供后续自动冲浪使用。
+                await self._browser.open_login_windows(login_urls)
+                requires_user_action = await self._browser.douyin_authentication_pending()
+                if not requires_user_action:
+                    self._store.set_state(state_key, 0)
+                    self._store.set_state("douyin_authentication_hold_until", 0)
+                    if not had_visible_window:
+                        # 这是本次误判临时打开的页面；网页正常就立即回收，避免用户
+                        # 误以为插件仍在等待人工操作。
+                        await self._browser.close()
+                    notice_state_key = "douyin_downloader_rejection_notice_until"
+                    should_notify = (
+                        float(self._store.get_state(notice_state_key, "0") or 0) <= now
+                    )
+                    if should_notify:
+                        self._store.set_state(
+                            notice_state_key,
+                            now + _DOUYIN_AUTHENTICATION_COOLDOWN_SECONDS,
+                        )
         if not should_notify:
             logger.info("再次前置插件专用抖音浏览器，下载拒绝提醒仍在冷却期 reason=%s", reason)
             return
@@ -2356,7 +2389,8 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     f"完整阅读后的摘要：{item.get('summary', '')}\n信息性质：{item.get('risk_label', '')}\n"
                     f"当天官方新内容：{bool(item.get('official_today'))}\n争议热度：{item.get('heat_score', 0)}\n"
                     f"值得说的角度：{item.get('interesting_point', '')}\n分享意图：{item.get('share_intent', '')}\n"
-                    "原帖会由插件自动放在最终消息前面。你的回复只写自己的自然反应，不要复述或解说正文。"
+                    "插件会先发送原生视频或图文媒体。你的回复只写自己的自然反应，"
+                    "不要复述或解说正文，也不要写链接、标题或“原帖”。"
                 )
                 reference_parts.append(item_reference)
                 arguments[_ITEM_ARG] = pending[0]
@@ -2424,7 +2458,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
             "【独立主动分享任务】\n"
             "这不是对任何群友消息的回复。不要回答、承接、评价或提及此前群聊中的任何人、"
             "角色、游戏、问题或表情；它们与本次分享无关。\n"
-            "插件会自动先发送原帖截图（如有）并在你的文字前附上原帖主体与链接。"
+            "插件会自动先发送原生视频或图文媒体。"
             "你只写一到三句像熟人群友顺手转帖后的自然感想，不要复述原帖、不要写“原帖：”或链接，"
             "更不要假装在回复某人的上一句话。\n"
             f"来源：{_text(item.get('source'))}\n"
@@ -2534,17 +2568,13 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 response[:160],
             )
             response = _fallback_share_comment(item)
-        result = dict(kwargs)
-        result["response"] = _format_share_message(
-            item,
-            response,
-            self.config.sharing.forward_body_max_chars,
-        )
         is_douyin_candidate = _is_douyin_candidate(item)
+        result = dict(kwargs)
         if is_douyin_candidate:
             # 不能在 Reply 的阻塞 Hook 中等待下载和 QQ 上传，否则宿主会在 6 秒后
             # 记录超时甚至熔断。清空本轮 Reply，由后台任务严格按“视频/图文在前、
-            # 短评在后”的顺序完成实际投递。
+            # 短评在后”的顺序完成实际投递。这里绝不能传入 _format_share_message
+            # 的旧文本转发体，否则链接、摘要会在原生视频之后重复出现。
             self._background_douyin_delivery_attempts.add(delivery_key)
             self._track_task(
                 self._deliver_douyin_share_background(
@@ -2552,7 +2582,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     session_id,
                     attempt_id,
                     item,
-                    _text(result["response"]),
+                    response,
                 )
             )
             result["response"] = ""
@@ -2560,62 +2590,17 @@ class DouyinSurfPlugin(MaiBotPlugin):
             result["enable_splitter"] = False
             result["enable_chinese_typo"] = False
             return {"action": "continue", "modified_kwargs": result}
-        try:
-            video_forwarded = await self._forward_douyin_share_video(item_id, session_id, item)
-        except DouyinMediaAuthenticationError as exc:
-            self._store.defer_share_for_authentication(
-                item_id,
-                session_id,
-                retry_after_seconds=_DOUYIN_MEDIA_AUTH_RETRY_SECONDS,
-                reason=str(exc),
-            )
-            self._pending_share.pop(session_id, None)
-            self._active_share_delivery_attempts.discard(delivery_key)
-            result["response"] = ""
-            result["skip_post_process"] = True
-            logger.warning(
-                "主动分享等待抖音重新登录后重试 item=%s stream=%s",
-                item_id,
-                session_id,
-            )
-            return {"action": "continue", "modified_kwargs": result}
-        except DouyinMediaUnavailableError as exc:
-            self._store.dismiss_share_candidate(item_id, session_id, reason=str(exc))
-            self._pending_share.pop(session_id, None)
-            self._active_share_delivery_attempts.discard(delivery_key)
-            result["response"] = ""
-            result["skip_post_process"] = True
-            logger.info(
-                "主动分享跳过无法发送原生视频的候选 item=%s stream=%s reason=%s",
-                item_id,
-                session_id,
-                exc,
-            )
-            return {"action": "continue", "modified_kwargs": result}
-        note_images_forwarded = (
-            await self._forward_douyin_note_images(item_id, session_id, item)
-            if is_douyin_candidate and not video_forwarded
-            else False
+        result["response"] = _format_share_message(
+            item,
+            response,
+            self.config.sharing.forward_body_max_chars,
         )
-        # 抖音短视频只能发送原生视频、抖音图文只能发送原帖图片；不能再走截图
-        # 或其他站点的合并转发逻辑，避免同一作品重复出现静态预览。
-        # 通用版不依赖额外媒体转发接口，分享内容直接由插件发送。
-        media_forwarded = False
-        if is_douyin_candidate and not video_forwarded and not note_images_forwarded:
-            # 通用版不依赖作者本地的媒体转发插件。没有可用媒体能力时仍发送
-            # 原链接和简短说明，确保候选不会因可选增强缺失而被错误丢弃。
-            result["response"] = f"{_text(result['response'])}\n原链接：{_text(item.get('url'))}"
-            logger.info(
-                "抖音媒体未转发，改为发送原链接 item=%s stream=%s",
-                item_id,
-                session_id,
-            )
-        screenshot_base64 = "" if is_douyin_candidate else _text(item.get("screenshot_base64"))
+        # 抖音候选已在上方提前返回至原生媒体后台投递；此处仅保留其他来源的
+        # 通用截图分享逻辑，不能再夹带一套永远不可达的抖音链接降级分支。
+        screenshot_base64 = _text(item.get("screenshot_base64"))
         screenshot_key = (item_id, session_id)
         if (
             screenshot_base64
-            and not video_forwarded
-            and not media_forwarded
             and session_id
             and not item.get("screenshot_shared_at")
             and screenshot_key not in self._pending_screenshot_sends
@@ -2651,15 +2636,20 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 else False
             )
             if not video_forwarded and not note_images_forwarded:
-                # 视频和图文都无法作为原生媒体发送时，仍可清晰说明来源；这里不把
-                # 下载限制伪装成一次成功的原生视频投递。
-                comment = f"{comment}\n原链接：{_text(item.get('url'))}"
+                # 自动冲浪只允许“原生媒体 + 短评”。媒体失败不能退化为链接文本，
+                # 否则会和视频成功投递的路径混在一起，造成一条候选多次刷屏。
+                self._store.dismiss_share_candidate(
+                    discovery_id,
+                    session_id,
+                    reason="无法完成抖音原生媒体投递",
+                )
                 logger.info(
-                    "抖音媒体未转发，后台发送原链接 item=%s stream=%s",
+                    "主动分享跳过未能投递原生媒体的候选 item=%s stream=%s",
                     discovery_id,
                     session_id,
                 )
-            await self.ctx.send.text(comment, session_id)
+                return
+            await self.ctx.send.text(_format_manual_douyin_share_message(item, comment), session_id)
             self._store.mark_shared(discovery_id, session_id)
             logger.info(
                 "抖音候选后台投递完成 item=%s stream=%s video=%s note_images=%s",
@@ -2706,7 +2696,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
         """下载合格抖音短视频，并通过所选 QQ 适配器发送原生视频。
 
         这里不依赖额外的媒体转发插件。未安装所选适配器、不是 QQ 群，或平台
-        拒绝视频时返回 ``False``，调用方会发送原链接。
+        拒绝视频时返回 ``False``，调用方会跳过该候选，不把链接伪装成媒体分享。
         """
 
         url = _text(item.get("url"))
@@ -2718,8 +2708,6 @@ class DouyinSurfPlugin(MaiBotPlugin):
         ):
             return False
         try:
-            browser_cookies = await self._browser.cookies_for(url)
-            browser_headers = await self._browser.request_headers_for(url)
             configured_max_bytes = int(self.config.sharing.douyin_video_max_bytes)
             effective_max_bytes = min(configured_max_bytes, _QQ_GROUP_VIDEO_MAX_BYTES)
             if configured_max_bytes > effective_max_bytes:
@@ -2728,14 +2716,59 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     effective_max_bytes,
                     configured_max_bytes,
                 )
-            downloaded = await download_short_video_for_share(
-                url,
-                self.ctx.paths.data_dir / "video-share-cache",
-                max_duration=self.config.candidate_filter.max_video_duration_seconds,
-                max_bytes=effective_max_bytes,
-                browser_cookies=browser_cookies,
-                browser_headers=browser_headers,
-            )
+            try:
+                playback_media = await self._browser.download_douyin_playback_media(
+                    url,
+                    max_bytes=effective_max_bytes,
+                )
+                downloaded = {
+                    "duration": int(playback_media.get("duration") or 0),
+                    "video_base64": base64.b64encode(playback_media["video_bytes"]).decode("ascii"),
+                }
+                logger.info(
+                    "已复用浏览器播放器媒体地址，跳过 yt-dlp 详情解析 discovery_id=%s stream=%s",
+                    discovery_id,
+                    session_id,
+                )
+            except DouyinPlaybackMediaTooLargeError as exc:
+                raise VideoFileTooLargeError(str(exc)) from exc
+            except DouyinPlaybackMediaError as exc:
+                # 页面未给出可用的 CDN 播放地址时，才回退到既有下载器路径。
+                # 这保持非标准播放器和旧版抖音页面的兼容性，但不会再优先触发
+                # 容易被拦截的详情 JSON 请求。
+                logger.info(
+                    "浏览器播放器媒体不可用，回退 yt-dlp 详情解析 discovery_id=%s error=%s",
+                    discovery_id,
+                    exc,
+                )
+                browser_cookies = await self._browser.cookies_for(url)
+                browser_headers = await self._browser.request_headers_for(url)
+                downloaded = await download_short_video_for_share(
+                    url,
+                    self.ctx.paths.data_dir / "video-share-cache",
+                    max_duration=self.config.candidate_filter.max_video_duration_seconds,
+                    max_bytes=effective_max_bytes,
+                    browser_cookies=browser_cookies,
+                    browser_headers=browser_headers,
+                )
+            except Exception as exc:
+                # 播放器 DOM 结构偶尔会随前端灰度调整。此处只处理浏览器提取阶段
+                # 的意外错误，保留 yt-dlp 作为明确的次级路径。
+                logger.info(
+                    "浏览器播放器媒体提取异常，回退 yt-dlp 详情解析 discovery_id=%s error=%s",
+                    discovery_id,
+                    exc,
+                )
+                browser_cookies = await self._browser.cookies_for(url)
+                browser_headers = await self._browser.request_headers_for(url)
+                downloaded = await download_short_video_for_share(
+                    url,
+                    self.ctx.paths.data_dir / "video-share-cache",
+                    max_duration=self.config.candidate_filter.max_video_duration_seconds,
+                    max_bytes=effective_max_bytes,
+                    browser_cookies=browser_cookies,
+                    browser_headers=browser_headers,
+                )
             group_id = await self._qq_group_id_for_stream(session_id)
             if not group_id:
                 logger.info(
@@ -2744,12 +2777,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     session_id,
                 )
                 return False
-            title = _text(item.get("observed_title")) or _text(item.get("title"))
+            # 原生视频成功时只投递视频本体。标题、原链接等文字会被 QQ 客户端拆分
+            # 成独立气泡，容易与后续 AI 短评混在一起，造成重复分享的观感。
             segments = [
-                {
-                    "type": "text",
-                    "data": {"text": f"{title}\n原链接：{url}".strip()},
-                },
                 {
                     "type": "video",
                     "data": {"file": f"base64://{downloaded['video_base64']}"},
@@ -2791,19 +2821,28 @@ class DouyinSurfPlugin(MaiBotPlugin):
             ) from exc
         except Exception as exc:
             if _is_douyin_media_authentication_error(exc):
-                logger.warning(
-                    "抖音原生视频下载需要重新登录 discovery_id=%s stream=%s error=%s",
+                if await self._browser.douyin_authentication_pending():
+                    logger.warning(
+                        "抖音原生视频下载需要重新登录 discovery_id=%s stream=%s error=%s",
+                        discovery_id,
+                        session_id,
+                        exc,
+                    )
+                    await self._request_douyin_authentication(
+                        reason="短视频下载被抖音拒绝，需要刷新登录态",
+                        url=url,
+                    )
+                    raise DouyinMediaAuthenticationError(
+                        "抖音视频下载要求刷新登录态或完成安全验证"
+                    ) from exc
+                # 网页正常而下载详情接口单独返回 403 时，不应中断整个手动搜索
+                # 或误导用户反复验证。调用方会继续尝试综合分下一名候选。
+                logger.info(
+                    "抖音网页登录正常但下载接口拒绝，跳过当前候选 discovery_id=%s stream=%s",
                     discovery_id,
                     session_id,
-                    exc,
                 )
-                await self._request_douyin_authentication(
-                    reason="短视频下载被抖音拒绝，需要刷新登录态",
-                    url=url,
-                )
-                raise DouyinMediaAuthenticationError(
-                    "抖音视频下载要求刷新登录态或完成安全验证"
-                ) from exc
+                raise DouyinMediaUnavailableError("抖音下载接口暂时拒绝该视频") from exc
             logger.exception("抖音短视频下载或发送失败 discovery_id=%s stream=%s", discovery_id, session_id)
             return False
         self._store.mark_video_shared(discovery_id)
@@ -2842,7 +2881,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 # 自动候选则优先复用深读阶段保存下来的正文图片地址。
                 page = await self._browser.read_page(
                     url,
-                    headless=self.config.browser.headless,
+                    headless=_DOUYIN_BROWSER_HEADLESS,
                     max_chars=self.config.browser.max_text_chars,
                 )
                 image_urls = _page_media_urls(page.get("images"), 9)
@@ -2859,9 +2898,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
             if not images_base64:
                 logger.info("抖音图文正文图片全部下载失败 item=%s", discovery_id)
                 return False
-            title = _text(item.get("observed_title")) or _text(item.get("title"))
             segments: list[dict[str, Any]] = [
-                {"type": "text", "content": f"{title}\n原链接：{url}".strip()},
                 *({"type": "image", "content": image_base64} for image_base64 in images_base64),
             ]
             sent = await self.ctx.send.hybrid(segments, session_id)
@@ -3038,7 +3075,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
         self._manual_douyin_active_count += 1
         self._manual_douyin_idle.clear()
         self._track_task(self._manual_douyin_search_and_share(query, stream_id))
-        return await self._send_command_reply(stream_id, f"我去翻翻「{query}」，从综合页里挑点赞最高的。")
+        return await self._send_command_reply(stream_id, f"我去翻翻「{query}」，按互动量和发布时间挑数据分最高的。")
 
     async def _recent_manual_douyin_chat(self, stream_id: str) -> str:
         """读取少量近期聊天，仅给手动分享短评提供当前群聊语气。"""
@@ -3149,7 +3186,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
             page = await asyncio.wait_for(
                 self._browser.read_page(
                     candidate_url,
-                    headless=self.config.browser.headless,
+                    headless=_DOUYIN_BROWSER_HEADLESS,
                     max_chars=7000,
                 ),
                 timeout=page_timeout,
@@ -3185,7 +3222,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
         return fallback
 
     async def _manual_douyin_search_and_share(self, query: str, stream_id: str) -> None:
-        """从综合页候选中快速按点赞选一条，再只为这一条生成短评。"""
+        """按综合搜索候选的数据分选择作品，再为最终作品生成短评。"""
 
         try:
             search_deadline = (
@@ -3202,8 +3239,8 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     search_type="general",
                     max_results=result_limit,
                     scroll_rounds=0,
-                    # 手动点播与自动抖音冲浪共用同一个隐藏窗口开关，避免设置互相矛盾。
-                    headless=self.config.browser.headless,
+                    # 手动点播与自动抖音冲浪均固定使用可见浏览器，避免页面结构分叉。
+                    headless=_DOUYIN_BROWSER_HEADLESS,
                     # 首屏达到目标就不必额外下拉；不足时持续累积合格候选，直到
                     # 达标、触底或耗尽整次命令的搜索时间预算。
                     target_result_count=target_results,
@@ -3262,7 +3299,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
                             # 共用搜索截止时间，不能因为去重而额外等待五分钟。
                             max_results=min(20, result_limit),
                             scroll_rounds=0,
-                            headless=self.config.browser.headless,
+                            headless=_DOUYIN_BROWSER_HEADLESS,
                             target_result_count=target_results,
                             search_timeout_seconds=remaining_seconds,
                             search_deadline_monotonic=search_deadline,
@@ -3300,47 +3337,61 @@ class DouyinSurfPlugin(MaiBotPlugin):
                         stream_id,
                     )
                 return
-            # 先只按搜索响应的公开点赞数排序，避免为每个候选都请求详情或模型；
-            # 最终胜出的作品才会在发送前进行一次页面深读和短评生成。
-            def like_count(item: dict[str, Any]) -> int:
-                match = re.search(r"点赞：\s*(\d+)", _text(item.get("snippet")))
-                return int(match.group(1)) if match else -1
-
-            ranked = sorted(self._store.get_discoveries(candidate_ids), key=like_count, reverse=True)
-            attempted_count = 0
-            for candidate in ranked:
+            # /抖音 是即时指令：直接使用综合页返回的互动量与发布时间计算数据分，
+            # 不为每条候选打开详情页或调用模型。自动分享仍维持 AI 深读后的综合分。
+            scored_candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for candidate in self._store.get_discoveries(candidate_ids):
                 discovery_id = int(candidate["id"])
                 if _is_douyin_note(candidate) and not self.config.candidate_filter.allow_douyin_notes:
                     self._store.dismiss_discovery(discovery_id, "手动抖音仅发送视频，已跳过图文笔记")
                     continue
+                score_breakdown = calculate_candidate_data_score(
+                    metrics=_json_dict(candidate.get("metrics_json")),
+                    published_at=_text(candidate.get("published_at")),
+                    settings=self.config.scoring,
+                    now=datetime.now(),
+                )
+                logger.info(
+                    "手动抖音数据评分 item=%s score=%.3f age_days=%s",
+                    discovery_id,
+                    float(score_breakdown["score"]),
+                    score_breakdown["age_days"],
+                )
+                scored_candidates.append((candidate, score_breakdown))
+            ranked = sorted(scored_candidates, key=lambda item: float(item[1]["score"]), reverse=True)
+            if not ranked:
+                await self.ctx.send.text(
+                    f"「{query}」找到了 {len(results)} 条综合页候选，但没有符合视频和时长要求的可用作品。",
+                    stream_id,
+                )
+                return
+            attempted_count = 0
+            media_attempt_count = 0
+            for candidate, _score_breakdown in ranked:
+                discovery_id = int(candidate["id"])
                 candidate_url = _text(candidate.get("url"))
                 if "douyin.com/video/" in candidate_url:
-                    browser_cookies = await self._browser.cookies_for(candidate_url)
-                    browser_headers = await self._browser.request_headers_for(candidate_url)
-                    try:
-                        duration = await probe_video_duration(
-                            candidate_url,
-                            self.ctx.paths.data_dir / "video-duration-probe-cache",
-                            browser_cookies=browser_cookies,
-                            browser_headers=browser_headers,
-                        )
-                    except Exception as exc:
-                        # 最终时长预检同样依赖 yt-dlp；403/Fresh cookies 与正式
-                        # 下载是同一种人工登录态问题，不能落入最外层后把英文错误
-                        # 原样发送到群聊。
-                        if _is_douyin_media_authentication_error(exc):
-                            logger.warning(
-                                "手动抖音时长预检需要重新登录 item=%s stream=%s error=%s",
-                                discovery_id,
-                                stream_id,
-                                exc,
+                    duration = _candidate_video_duration_seconds(candidate)
+                    if duration is None:
+                        browser_cookies = await self._browser.cookies_for(candidate_url)
+                        browser_headers = await self._browser.request_headers_for(candidate_url)
+                        try:
+                            duration = await probe_video_duration(
+                                candidate_url,
+                                self.ctx.paths.data_dir / "video-duration-probe-cache",
+                                browser_cookies=browser_cookies,
+                                browser_headers=browser_headers,
                             )
-                            await self._request_douyin_authentication(
-                                reason="短视频时长预检被抖音拒绝，需要刷新登录态",
-                                url=candidate_url,
-                            )
-                            return
-                        raise
+                        except Exception as exc:
+                            if _is_douyin_media_authentication_error(exc):
+                                logger.info(
+                                    "手动抖音跳过下载详情接口拒绝的候选 item=%s stream=%s error=%s",
+                                    discovery_id,
+                                    stream_id,
+                                    exc,
+                                )
+                                continue
+                            raise
                     max_duration = self.config.candidate_filter.max_video_duration_seconds
                     if duration <= 0 or duration > max_duration:
                         self._store.dismiss_discovery(
@@ -3358,7 +3409,9 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     self._store.dismiss_discovery(discovery_id, "手动抖音候选存在明显安全风险")
                     continue
                 attempted_count += 1
-                comment = await self._generate_manual_douyin_comment(query, stream_id, candidate)
+                media_attempt_count += 1
+                # 手动命令先把数据分最高作品的媒体投递出去。短评只对真正成功的
+                # 最终作品生成，避免下载接口拒绝时白等页面深读、抽帧和模型调用。
                 try:
                     video_forwarded = await self._forward_douyin_share_video(discovery_id, stream_id, candidate)
                 except DouyinMediaAuthenticationError:
@@ -3367,6 +3420,8 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     return
                 except DouyinMediaUnavailableError as exc:
                     logger.info("手动抖音跳过无法发送原生视频的候选 item=%s reason=%s", discovery_id, exc)
+                    if media_attempt_count >= 3:
+                        break
                     continue
                 note_images_forwarded = (
                     await self._forward_douyin_note_images(discovery_id, stream_id, candidate)
@@ -3381,18 +3436,22 @@ class DouyinSurfPlugin(MaiBotPlugin):
                         query,
                         discovery_id,
                     )
+                    if media_attempt_count >= 3:
+                        break
                     continue
                 if not video_forwarded and not note_images_forwarded:
-                    # 媒体转发是可选增强。没有兼容 API 或下载失败时仍返回原链接，
-                    # 让非 QQ 平台和纯文本安装也能正常使用 /抖音。
+                    # 每次 /抖音 分享只允许“媒体本体 + AI 短评”。没有成功投递媒体
+                    # 时继续尝试下一条，不能单独发送原链接。
                     logger.info(
-                        "手动抖音候选未能发送媒体，改为发送原链接 query=%s item=%s",
+                        "手动抖音候选未能发送媒体，继续尝试下一条 query=%s item=%s",
                         query,
                         discovery_id,
                     )
+                    if media_attempt_count >= 3:
+                        break
+                    continue
+                comment = await self._generate_manual_douyin_comment(query, stream_id, candidate)
                 message = _format_manual_douyin_share_message(candidate, comment)
-                if not video_forwarded and not note_images_forwarded:
-                    message = f"{message}\n原链接：{_text(candidate.get('url'))}"
                 await self.ctx.send.text(message, stream_id)
                 self._store.mark_shared(discovery_id, stream_id)
                 logger.info(
@@ -3404,7 +3463,8 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 )
                 return
             await self.ctx.send.text(
-                f"「{query}」找到了 {len(results)} 条综合页候选，已按点赞从高到低尝试 {attempted_count} 条；都没能成功完成媒体下载和 QQ 合并转发。",
+                f"「{query}」找到了 {len(results)} 条综合页候选，已按数据分尝试 {attempted_count} 条；"
+                "前三条媒体下载都没有成功，已停止继续重试，避免让你一直等。",
                 stream_id,
             )
         except DouyinSearchAuthenticationError:
