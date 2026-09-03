@@ -2179,37 +2179,25 @@ class DouyinSurfPlugin(MaiBotPlugin):
                 self._store.dismiss_discovery(discovery_id, "已关闭抖音图文候选")
                 logger.info("已跳过历史图文候选 item=%s stream=%s", discovery_id, stream_id)
                 continue
-            intent = (
-                "这是已通过内容质量、分享时段、冷却和额度检查的抖音主动分享任务，必须调用 reply 完成分享。"
-                "原帖和链接会放在回复前；只补一到三句自然、简短的分享感想，不要编造事实或复述原帖。"
-            )
-            metadata = {
-                _ITEM_ARG: discovery_id,
-                "source": candidate.get("source", ""),
-                "title": candidate.get("title", ""),
-                "url": candidate.get("url", ""),
-                "summary": candidate.get("summary", ""),
-                "interesting_point": candidate.get("interesting_point", ""),
-                "risk_label": candidate.get("risk_label", ""),
-                "share_intent": candidate.get("share_intent", ""),
-            }
             self._store.mark_share_queued(discovery_id, stream_id)
             attempt_id = uuid.uuid4().hex
-            metadata[_SHARE_ATTEMPT_ARG] = attempt_id
             self._pending_share[stream_id] = (discovery_id, time.time(), attempt_id)
-            try:
-                await self.ctx.maisaka.proactive.trigger(
+            delivery_key = (stream_id, attempt_id)
+            # 自动分享由插件直接完成。此前把候选交给 Planner/Replyer 时，普通群聊
+            # 回合可能与主动任务并发，导致内部投递标记在 Reply 参数中丢失，最终只
+            # 发出短评而没有媒体。直接后台投递可保证固定顺序：媒体本体、再 AI 短评。
+            self._active_share_delivery_attempts.add(delivery_key)
+            self._background_douyin_delivery_attempts.add(delivery_key)
+            self._track_task(
+                self._deliver_douyin_share_background(
+                    discovery_id,
                     stream_id,
-                    intent,
-                    reason=f"发现高价值社区见闻：{candidate.get('title', '')}",
-                    priority="normal",
-                    metadata=metadata,
+                    attempt_id,
+                    candidate,
+                    None,
                 )
-            except Exception:
-                self._pending_share.pop(stream_id, None)
-                self._store.restore_share_candidate(discovery_id, stream_id)
-                raise
-            logger.info("已唤醒抖音候选分享 item=%s stream=%s", discovery_id, stream_id)
+            )
+            logger.info("已直接启动抖音媒体分享 item=%s stream=%s", discovery_id, stream_id)
             return True
         return False
 
@@ -2619,7 +2607,7 @@ class DouyinSurfPlugin(MaiBotPlugin):
         session_id: str,
         attempt_id: str,
         item: dict[str, Any],
-        comment: str,
+        comment: str | None,
     ) -> None:
         """在 Hook 返回后投递抖音媒体与短评，避免阻塞宿主回复管线。"""
 
@@ -2649,7 +2637,8 @@ class DouyinSurfPlugin(MaiBotPlugin):
                     session_id,
                 )
                 return
-            await self.ctx.send.text(_format_manual_douyin_share_message(item, comment), session_id)
+            final_comment = comment or await self._generate_automatic_douyin_comment(item)
+            await self.ctx.send.text(_format_manual_douyin_share_message(item, final_comment), session_id)
             self._store.mark_shared(discovery_id, session_id)
             logger.info(
                 "抖音候选后台投递完成 item=%s stream=%s video=%s note_images=%s",
@@ -2686,6 +2675,33 @@ class DouyinSurfPlugin(MaiBotPlugin):
             self._pending_share.pop(session_id, None)
             self._active_share_delivery_attempts.discard(delivery_key)
             self._background_douyin_delivery_attempts.discard(delivery_key)
+
+    async def _generate_automatic_douyin_comment(self, item: dict[str, Any]) -> str:
+        """仅在媒体成功发出后，为自动分享生成一段独立的自然短评。"""
+
+        fallback = _fallback_share_comment(item)
+        prompt = (
+            "你正在一个中文兴趣群里看完一条抖音视频，准备在视频发送后补一句自然短评。"
+            "只依据给出的标题和已核验摘要，不补充不存在的画面、人物或事实。"
+            "输出 1 到 2 句口语化中文，总计不超过 70 字；不要写标题、链接、来源、原帖、"
+            "‘我来分享’或任何分析过程。只输出短评正文。\n\n"
+            f"标题：{_text(item.get('observed_title')) or _text(item.get('title'))}\n"
+            f"已核验摘要：{_text(item.get('summary')) or _text(item.get('full_text'))[:500]}\n"
+            f"分享角度：{_text(item.get('share_intent'))}"
+        )
+        try:
+            async with self._background_llm_lock:
+                result = await asyncio.wait_for(
+                    self._generate_text_model(prompt, 0.65, 240),
+                    timeout=65,
+                )
+            generated = _compact_share_excerpt(llm_text(result), 100)
+            if generated and not _looks_like_internal_share_analysis(generated):
+                return generated
+            logger.warning("自动分享短评模型返回无效内容，改用本地短评 item=%s", item.get("id"))
+        except Exception as exc:
+            logger.warning("自动分享短评模型失败，改用本地短评 item=%s error=%s", item.get("id"), exc)
+        return fallback
 
     async def _forward_douyin_share_video(
         self,
