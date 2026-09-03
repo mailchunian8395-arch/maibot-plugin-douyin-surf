@@ -1,6 +1,6 @@
 [plugin]
 enabled = false
-config_version = "1.2.5"
+config_version = "1.2.11"
 
 [identity]
 values = "只分享来源明确、适合当前聊天环境的抖音内容。拒绝涉及明确未成年人、非自愿私密内容、违法内容、恶意引流或无法核实的夸张信息。"
@@ -47,8 +47,20 @@ min_collect_count = 0
 min_share_count = 0
 allow_douyin_notes = false
 max_video_duration_seconds = 180
-recent_only_enabled = false
-recent_days = 1
+max_publish_age_days = 0
+
+[scoring]
+like_weight = 0.18
+comment_weight = 0.12
+collect_weight = 0.12
+share_weight = 0.13
+recency_weight = 0.1
+ai_weight = 0.35
+like_target = 100000
+comment_target = 10000
+collect_target = 10000
+share_target = 10000
+recency_window_days = 30
 
 [sharing]
 enabled = false
@@ -61,13 +73,15 @@ screenshot_enabled = true
 screenshot_probability = 0.9
 screenshot_max_bytes = 5000000
 douyin_video_forward_enabled = true
-douyin_video_max_bytes = 16000000
+douyin_video_max_bytes = 11500000
 reaction_window_minutes = 120
 video_sender_adapter = "自动识别"
 
+[command_access]
+enabled = true
+
 [browser]
 enabled = true
-headless = true
 page_timeout_seconds = 45
 max_text_chars = 30000
 native_site_browsing_enabled = true

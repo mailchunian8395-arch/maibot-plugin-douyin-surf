@@ -1,22 +1,28 @@
 # 发布检查清单
 
-当前发布版本为 `1.2.0`。请使用公开仓库 `https://github.com/mailchunian8395-arch/maibot-plugin-douyin-surf`，按以下顺序完成发布。
+当前发布版本为 `1.2.11`。请使用公开仓库 `https://github.com/mailchunian8395-arch/maibot-plugin-douyin-surf`，按以下顺序完成发布。
 
 ## 发布信息确认
 
 - `_manifest.json` 中的 ID 固定为 `chunian.maibot-plugin-douyin-surf`；
 - 仓库、文档、主页和 Issue 链接均指向 `mailchunian8395-arch/maibot-plugin-douyin-surf`；
-- `_manifest.json`、配置模型默认值和发布副本 `config.toml` 的版本必须一致；本次为 `1.2.0`。
+- `_manifest.json`、配置模型默认值和发布副本 `config.toml` 的版本必须一致；本次为 `1.2.11`。
 
 如 GitHub 用户名或仓库名与上述地址不一致，必须在上传前统一修改 manifest、README 和本清单中的链接。
 
 ## 发布前命令
 
-在 MaiBot 根目录执行：
+先把运行副本中的公开源码同步到独立发布工作副本；同步脚本会保留发布副本自己的安全默认 `config.toml`，并排除本机配置、浏览器数据和交接记录：
 
 ```powershell
-py -3.14 plugins\maibot-plugin-douyin-surf\scripts\validate_release.py
-py -3.14 -m py_compile plugins\maibot-plugin-douyin-surf\plugin.py plugins\maibot-plugin-douyin-surf\config_model.py
+py -3.14 plugins\maibot-plugin-douyin-surf\scripts\sync_publish_workspace.py
+```
+
+然后进入发布工作副本执行：
+
+```powershell
+py -3.14 scripts\validate_release.py
+py -3.14 -m py_compile plugin.py config_model.py
 ```
 
 然后确认默认配置仍符合安全原则：

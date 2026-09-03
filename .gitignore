@@ -1,6 +1,11 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
 data/
 browser-profile/
+config_back/
+logs/
+video-duration-probe-cache/
 video-share-cache/
 *.sqlite3
+V2_HANDOFF.md

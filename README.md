@@ -79,9 +79,22 @@ flowchart LR
 
 ### 第一步：安装与登录
 
-1. 将仓库克隆或复制到 MaiBot 的 `plugins/` 目录，并在插件页找到“抖音冲浪与分享”。
-2. 发送 `/抖音浏览器登录`，在插件打开的**专用浏览器**中登录抖音。
-3. 如遇人机验证，请直接在该浏览器窗口完成；不要连续重复发送搜索命令。
+1. 在 MaiBot 根目录克隆插件：
+
+   ```powershell
+   git clone https://github.com/mailchunian8395-arch/maibot-plugin-douyin-surf.git plugins/maibot-plugin-douyin-surf
+   ```
+
+   也可以下载仓库压缩包，将解压后的完整仓库放到 `plugins/maibot-plugin-douyin-surf/`。请确认该目录下能直接看到 `_manifest.json` 和 `plugin.py`，不要多套一层文件夹。
+2. 启动或重启 MaiBot。插件运行时会读取 `_manifest.json` 中声明的 Python 依赖；若日志提示依赖同步失败，请在 MaiBot 使用的 Python 环境中执行：
+
+   ```powershell
+   uv pip install -r plugins/maibot-plugin-douyin-surf/requirements.txt
+   ```
+
+3. 在插件管理页确认能找到“抖音冲浪与分享”。
+4. 发送 `/抖音浏览器登录`，在插件打开的**专用浏览器**中登录抖音。
+5. 如遇人机验证，请直接在该浏览器窗口完成；不要连续重复发送搜索命令。
 
 ### 第二步：先做手动验证
 
