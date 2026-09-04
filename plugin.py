@@ -847,6 +847,10 @@ class DouyinSurfPlugin(MaiBotPlugin):
         # 自动补货结束时会清理专用浏览器；手动 /抖音 的最终下载、视觉核验和
         # QQ 视频发送仍在使用该浏览器时，绝不能让它抢先关闭上下文。
         self._manual_douyin_active_count = 0
+        # 所有聊天流共用同一个抖音登录档案和可见浏览器，因此手动指令必须全局
+        # 串行执行。锁覆盖搜索、评分、媒体投递和短评发送，保证先到先服务，
+        # 也避免后一条搜索在前一条下载期间抢走浏览器页面。
+        self._manual_douyin_queue_lock = asyncio.Lock()
         # `/抖音` 是用户正在等待的前台操作。自动补货、筛选与自动分享必须在
         # 它开始后停在下一处安全检查点，等最后的媒体发送完成后再恢复。
         self._manual_douyin_idle = asyncio.Event()
@@ -3088,10 +3092,50 @@ class DouyinSurfPlugin(MaiBotPlugin):
             return denied
         # 在创建后台任务前就声明前台优先级，避免自动补货在这一小段调度窗口中
         # 继续启动下一轮浏览或清理浏览器。
+        waiting_ahead = self._manual_douyin_active_count
         self._manual_douyin_active_count += 1
         self._manual_douyin_idle.clear()
-        self._track_task(self._manual_douyin_search_and_share(query, stream_id))
+        self._track_task(
+            self._run_manual_douyin_queue_item(
+                query,
+                stream_id,
+                waiting_ahead=waiting_ahead,
+            )
+        )
+        if waiting_ahead:
+            return await self._send_command_reply(
+                stream_id,
+                f"已加入抖音队列：「{query}」前面还有 {waiting_ahead} 个请求，轮到后我再开始搜索。",
+            )
         return await self._send_command_reply(stream_id, f"我去翻翻「{query}」，按互动量和发布时间挑数据分最高的。")
+
+    async def _run_manual_douyin_queue_item(
+        self,
+        query: str,
+        stream_id: str,
+        *,
+        waiting_ahead: int,
+    ) -> None:
+        """完整串行执行一条手动点播，并在队列清空后恢复自动冲浪。"""
+
+        try:
+            async with self._manual_douyin_queue_lock:
+                if waiting_ahead:
+                    await self.ctx.send.text(
+                        f"轮到「{query}」了，我现在开始按互动量和发布时间挑选。",
+                        stream_id,
+                    )
+                logger.info(
+                    "开始处理手动抖音队列 query=%s stream=%s waiting_ahead=%s",
+                    query,
+                    stream_id,
+                    waiting_ahead,
+                )
+                await self._manual_douyin_search_and_share(query, stream_id)
+        finally:
+            self._manual_douyin_active_count = max(0, self._manual_douyin_active_count - 1)
+            if not self._manual_douyin_active_count:
+                self._manual_douyin_idle.set()
 
     async def _recent_manual_douyin_chat(self, stream_id: str) -> str:
         """读取少量近期聊天，仅给手动分享短评提供当前群聊语气。"""
@@ -3494,11 +3538,6 @@ class DouyinSurfPlugin(MaiBotPlugin):
         except Exception as exc:
             logger.exception("手动抖音搜索失败 query=%s", query)
             await self.ctx.send.text(f"这次抖音搜索没跑顺：{str(exc)[:180]}", stream_id)
-        finally:
-            self._manual_douyin_active_count = max(0, self._manual_douyin_active_count - 1)
-            if not self._manual_douyin_active_count:
-                self._manual_douyin_idle.set()
-
     @Command("douyin_surf_browser_login", description="打开抖音冲浪专用 Chrome 档案", pattern=r"^/抖音浏览器登录(?:\s+(?P<url>https?://\S+))?$")
     async def command_browser_login(self, stream_id: str = "", matched_groups: dict[str, str] | None = None, **kwargs: Any):
         del kwargs
