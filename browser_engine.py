@@ -78,6 +78,63 @@ class DouyinPlaybackMediaTooLargeError(DouyinPlaybackMediaError):
     """浏览器播放地址返回的视频超过 QQ 可投递上限。"""
 
 
+def _select_douyin_main_video(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """从抖音页面的多层播放器中选择有真实画面的前景主视频。"""
+
+    valid: list[tuple[float, dict[str, Any]]] = []
+    for candidate in candidates:
+        source = str(candidate.get("source") or "").strip()
+        duration = float(candidate.get("duration") or 0)
+        video_width = int(candidate.get("video_width") or 0)
+        video_height = int(candidate.get("video_height") or 0)
+        filter_style = str(candidate.get("filter") or "").lower()
+        if (
+            not source.startswith(("https://", "http://"))
+            or not bool(candidate.get("visible"))
+            or "blur(" in filter_style
+            or duration <= 0
+            or video_width < 32
+            or video_height < 32
+        ):
+            continue
+        rendered_area = max(0, int(candidate.get("rendered_width") or 0)) * max(
+            0,
+            int(candidate.get("rendered_height") or 0),
+        )
+        score = float(rendered_area)
+        if not bool(candidate.get("paused")):
+            score += 10_000_000
+        if int(candidate.get("ready_state") or 0) >= 2:
+            score += 5_000_000
+        if str(candidate.get("object_fit") or "").lower() == "contain":
+            score += 3_000_000
+        valid.append((score, candidate))
+    if not valid:
+        return None
+    return max(valid, key=lambda item: item[0])[1]
+
+
+def _media_payload_has_video_track(payload: bytes, content_type: str) -> bool:
+    """确认下载结果至少包含视频轨，拒绝音频流和播放器占位响应。"""
+
+    if not payload:
+        return False
+    normalized_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    looks_like_mp4 = normalized_type in {"video/mp4", "application/mp4"} or payload[4:8] == b"ftyp"
+    if looks_like_mp4:
+        offset = 0
+        while True:
+            handler = payload.find(b"hdlr", offset)
+            if handler < 0:
+                return False
+            if payload[handler + 12 : handler + 16] == b"vide":
+                return True
+            offset = handler + 4
+    # 抖音目前的浏览器直链主要是 MP4。若后续改为 WebM，只接受具有标准
+    # EBML 文件头的 video/webm，不能仅凭服务端声明的 Content-Type 放行。
+    return normalized_type == "video/webm" and payload.startswith(b"\x1aE\xdf\xa3")
+
+
 def _is_closed_browser_error(exc: Exception) -> bool:
     """只识别 Playwright 明确报告的浏览器关闭，不把普通页面错误误作重试。"""
 
@@ -1309,80 +1366,90 @@ class DeepBrowser:
         async with self._lock:
             context = await self._ensure(headless=False)
             page = await self._open_work_page(context)
-            response_urls: list[str] = []
-
-            def remember_playback_response(response: Any) -> None:
-                try:
-                    response_url = str(response.url or "").strip()
-                    content_type = str(response.headers.get("content-type") or "").lower()
-                except Exception:
-                    return
-                looks_like_playback = (
-                    content_type.startswith("video/")
-                    or "aweme/v1/play" in response_url
-                    or "/play/" in response_url
-                )
-                if looks_like_playback and response_url.startswith(("https://", "http://")):
-                    response_urls.append(response_url)
-
-            page.on("response", remember_playback_response)
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
                 await page.wait_for_timeout(900)
-                video = page.locator("video").first
-                video_details = await video.evaluate(
-                    """element => {
+                videos = page.locator("video")
+                await videos.evaluate_all(
+                    """elements => elements.forEach(element => {
                         element.muted = true;
                         void element.play().catch(() => {});
+                    })"""
+                )
+                await page.wait_for_timeout(2_000)
+                video_candidates = await videos.evaluate_all(
+                    """elements => elements.map(element => {
+                        const style = window.getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        const duration = Number(element.duration || 0);
+                        const layerFilters = [];
+                        let layerVisible = true;
+                        let layer = element;
+                        for (let depth = 0; layer && depth < 6; depth += 1, layer = layer.parentElement) {
+                            const layerStyle = window.getComputedStyle(layer);
+                            layerFilters.push(layerStyle.filter || '');
+                            if (layerStyle.display === 'none'
+                                || layerStyle.visibility === 'hidden'
+                                || Number(layerStyle.opacity || 1) <= 0.05) {
+                                layerVisible = false;
+                            }
+                        }
                         return {
                             source: element.currentSrc || element.src || '',
-                            duration: Number(element.duration || 0),
+                            duration: Number.isFinite(duration) ? duration : 0,
+                            video_width: Number(element.videoWidth || 0),
+                            video_height: Number(element.videoHeight || 0),
+                            rendered_width: Math.round(rect.width || 0),
+                            rendered_height: Math.round(rect.height || 0),
+                            ready_state: Number(element.readyState || 0),
+                            paused: Boolean(element.paused),
+                            filter: layerFilters.join(' '),
+                            object_fit: style.objectFit || '',
+                            visible: layerVisible
+                                && rect.width >= 32
+                                && rect.height >= 32,
                         };
-                    }"""
+                    })"""
                 )
-                await page.wait_for_timeout(1_500)
-                playback_urls: list[str] = []
-                source = str((video_details or {}).get("source") or "").strip()
-                if source.startswith(("https://", "http://")):
-                    playback_urls.append(source)
-                playback_urls.extend(response_urls)
-                deduplicated_urls = list(dict.fromkeys(playback_urls))
-                if not deduplicated_urls:
-                    raise DouyinPlaybackMediaError("页面没有暴露可下载的播放器媒体地址")
-                for media_url in deduplicated_urls:
-                    try:
-                        response = await context.request.get(
-                            media_url,
-                            headers={"Referer": str(page.url)},
-                            timeout=min(self.timeout_ms, 30_000),
+                video_details = _select_douyin_main_video(
+                    video_candidates if isinstance(video_candidates, list) else []
+                )
+                if video_details is None:
+                    logger.info("抖音页面未找到元数据完整的前景主视频 candidates=%s", len(video_candidates or []))
+                    raise DouyinPlaybackMediaError("页面只有背景、占位或元数据不完整的视频层")
+                media_url = str(video_details.get("source") or "").strip()
+                try:
+                    response = await context.request.get(
+                        media_url,
+                        headers={"Referer": str(page.url)},
+                        timeout=min(self.timeout_ms, 30_000),
+                    )
+                    content_type = str(response.headers.get("content-type") or "").lower()
+                    content_length = int(response.headers.get("content-length") or 0)
+                    if not response.ok or not content_type.startswith("video/"):
+                        raise DouyinPlaybackMediaError("前景主视频地址没有返回视频响应")
+                    if content_length > limit:
+                        raise DouyinPlaybackMediaTooLargeError(
+                            f"播放器媒体 {content_length} 字节超过 QQ 原生视频上限 {limit} 字节"
                         )
-                        content_type = str(response.headers.get("content-type") or "").lower()
-                        content_length = int(response.headers.get("content-length") or 0)
-                        if not response.ok or not content_type.startswith("video/"):
-                            continue
-                        if content_length > limit:
-                            raise DouyinPlaybackMediaTooLargeError(
-                                f"播放器媒体 {content_length} 字节超过 QQ 原生视频上限 {limit} 字节"
-                            )
-                        payload = await response.body()
-                        if not payload:
-                            continue
-                        if len(payload) > limit:
-                            raise DouyinPlaybackMediaTooLargeError(
-                                f"播放器媒体 {len(payload)} 字节超过 QQ 原生视频上限 {limit} 字节"
-                            )
-                        return {
-                            "video_bytes": payload,
-                            "duration": int(float((video_details or {}).get("duration") or 0)),
-                            "media_url": media_url,
-                        }
-                    except DouyinPlaybackMediaTooLargeError:
-                        raise
-                    except Exception as exc:
-                        logger.info("浏览器播放器媒体请求失败 url=%s error=%s", media_url, exc)
-                raise DouyinPlaybackMediaError("播放器媒体地址未返回可用视频响应")
+                    payload = await response.body()
+                    if len(payload) > limit:
+                        raise DouyinPlaybackMediaTooLargeError(
+                            f"播放器媒体 {len(payload)} 字节超过 QQ 原生视频上限 {limit} 字节"
+                        )
+                    if not _media_payload_has_video_track(payload, content_type):
+                        raise DouyinPlaybackMediaError("播放器响应不包含可验证的视频轨")
+                    return {
+                        "video_bytes": payload,
+                        "duration": int(float(video_details.get("duration") or 0)),
+                        "media_url": media_url,
+                    }
+                except (DouyinPlaybackMediaError, DouyinPlaybackMediaTooLargeError):
+                    raise
+                except Exception as exc:
+                    logger.info("浏览器前景主视频请求失败 url=%s error=%s", media_url, exc)
+                    raise DouyinPlaybackMediaError("前景主视频地址下载失败") from exc
             finally:
-                page.remove_listener("response", remember_playback_response)
                 await self._close_work_page(page)
 
     async def capture_post_preview(self, url: str, *, headless: bool = False) -> str:

@@ -209,6 +209,55 @@ class BrowserClosedErrorTests(TestCase):
         self.assertFalse(browser_engine._is_closed_browser_error(error))
 
 
+class DouyinMainVideoSelectionTests(TestCase):
+    """播放器直链必须来自有真实画面的前景视频层。"""
+
+    @staticmethod
+    def _video(**overrides: Any) -> dict[str, Any]:
+        candidate = {
+            "source": "https://v.example.invalid/main.mp4",
+            "duration": 12.5,
+            "video_width": 1080,
+            "video_height": 1920,
+            "rendered_width": 360,
+            "rendered_height": 640,
+            "ready_state": 4,
+            "paused": False,
+            "filter": "none",
+            "visible": True,
+        }
+        candidate.update(overrides)
+        return candidate
+
+    def test_skips_blurred_background_and_selects_foreground_video(self) -> None:
+        blurred_background = self._video(
+            source="https://v.example.invalid/background.mp4",
+            rendered_width=1280,
+            rendered_height=720,
+            filter="blur(24px)",
+        )
+        foreground = self._video()
+
+        selected = browser_engine._select_douyin_main_video([blurred_background, foreground])
+
+        self.assertIs(selected, foreground)
+
+    def test_rejects_zero_duration_or_missing_intrinsic_dimensions(self) -> None:
+        candidates = [
+            self._video(duration=0),
+            self._video(video_width=0, video_height=0),
+        ]
+
+        self.assertIsNone(browser_engine._select_douyin_main_video(candidates))
+
+    def test_mp4_payload_must_contain_video_handler(self) -> None:
+        video_mp4 = b"\x00\x00\x00\x18hdlr" + (b"\x00" * 8) + b"vide" + (b"\x00" * 8)
+        audio_mp4 = b"\x00\x00\x00\x18hdlr" + (b"\x00" * 8) + b"soun" + (b"\x00" * 8)
+
+        self.assertTrue(browser_engine._media_payload_has_video_track(video_mp4, "video/mp4"))
+        self.assertFalse(browser_engine._media_payload_has_video_track(audio_mp4, "video/mp4"))
+
+
 class DouyinSearchPayloadTests(TestCase):
     """覆盖字符串包装响应、付费内容与互动指标过滤。"""
 
